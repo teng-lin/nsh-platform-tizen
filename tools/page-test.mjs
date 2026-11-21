@@ -94,7 +94,8 @@ await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
 const base = `http://127.0.0.1:${server.address().port}`;
 
 const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'nsh-tizen-test-'));
-const chrome = spawn(browser, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1920,1080', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+// Detached: its own process group, so its helpers end with it.
+const chrome = spawn(browser, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1920,1080', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
 const wsUrl = await new Promise((ok, fail) => {
     let err = '';
     chrome.stderr.on('data', (d) => { err += d; const m = /ws:\/\/[^\s]+/.exec(err); if (m) ok(m[0]); });
@@ -246,6 +247,20 @@ for (const file of ['index.html', 'page-thread.html']) {
     check(violations.length === 0, `no CSP violations ${JSON.stringify(violations)}`);
     for (const [ok, what] of cases || [[false, 'runtime cases ran']]) check(ok, what);
 
+    // An error storm, then a fatal trap: the host still hears the fatal,
+    // and what is saved stays small.
+    const storm = await p.evaluate(`(function () {
+        var s = NshTizen.session(), heard = [];
+        s.options.onError = function (t) { heard.push(t); };
+        var long = new Array(400).join('x');
+        for (var i = 0; i < 300; i++) s.error('error ' + i + ' ' + long);
+        s.fatal('the app stopped: test');
+        return JSON.stringify({ fatal: heard.indexOf('the app stopped: test') >= 0, saved: (localStorage.getItem('nsh.metrics') || '').length });
+    })()`);
+    const st = JSON.parse(storm);
+    check(st.fatal, 'a fatal error reaches onError after 300 errors');
+    check(st.saved < 60000, `saved metrics stay small (${st.saved} characters for five launches)`);
+
     // A second start replaces the first: one app on the page.
     await p.evaluate('NshTizen.start({ container: document.getElementById("app"), module: "app.wasm", version: window.NSH_MODULE_VERSION, thread: window.NSH_THREAD || "worker" }) && 1');
     check(await p.until('window.__nsh.firstPaintAt > 0', 20000), 'a second start paints');
@@ -253,10 +268,18 @@ for (const file of ['index.html', 'page-thread.html']) {
     p.ws.close();
 }
 
+// Chrome and its helpers (the whole group), then the profile they wrote
+// in; a profile left behind is not a test failure.
 const exited = new Promise((ok) => chrome.once('exit', ok));
-chrome.kill();
+try { process.kill(-chrome.pid, 'SIGTERM'); } catch (e) { chrome.kill(); }
 await Promise.race([exited, new Promise((ok) => setTimeout(ok, 5000))]);
+try { process.kill(-chrome.pid, 'SIGKILL'); } catch (e) { /* gone */ }
 server.close();
-fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+await new Promise((ok) => setTimeout(ok, 300));
+try {
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+} catch (e) {
+    console.log(`note: could not remove ${profile}: ${e.code}`);
+}
 console.log(failures ? `${failures} failed` : 'all passed');
 process.exit(failures ? 1 : 0);

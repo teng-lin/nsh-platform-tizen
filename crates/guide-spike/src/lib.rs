@@ -1,8 +1,12 @@
-//! Spike: a guide over live video like Patina's, written with NSH and
-//! `iptv-core`'s guide focus model on its synthetic schedule, rendered on a
-//! Samsung TV by `nsh-platform-tizen`. It measures what Patina's real UI
-//! would cost there: a header over a transparent video preview, a time
-//! ruler, and channel rows whose program cells follow the remote's focus.
+//! The platform's test app: a guide over live video like Patina's, written
+//! with NSH and `iptv-core`'s guide focus model on its synthetic schedule,
+//! rendered on a Samsung TV by `nsh-platform-tizen`. A header over the
+//! video preview (a `tv.player` native component the host page supplies),
+//! a time ruler, and channel rows whose program cells follow the remote's
+//! focus; a logo image and a search input (Red) exercise the rest.
+//!
+//! Keys: arrows move, OK plays the focused channel, CH+/CH- zap,
+//! Play/Pause pauses, Stop stops, Red searches, Back leaves.
 //!
 //! The rows are a fixed set of slots: moving the focus changes their text,
 //! colors and frames, not the tree (as Patina's virtualized grid recycles
@@ -30,6 +34,13 @@ const TEXT: u32 = 0xE3E8EC;
 const MUTED: u32 = 0x9AA5AD;
 const DARK_TEXT: u32 = 0x101418;
 
+/// Public test streams the preview plays.
+const STREAMS: [&str; 3] = [
+    "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+    "https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8",
+    "https://test-streams.mux.dev/test_001/stream.m3u8",
+];
+
 fn schedule() -> SyntheticSchedule {
     SyntheticSchedule
 }
@@ -46,7 +57,12 @@ fn clock(minute: i32) -> String {
 }
 
 fn program_line(channel: usize, p: Program) -> String {
-    format!("{} – {}  {}", clock(p.start), clock(p.end), schedule().title(channel, p))
+    format!(
+        "{} – {}  {}",
+        clock(p.start),
+        clock(p.end),
+        schedule().title(channel, p)
+    )
 }
 
 /// The first row shown, keeping `channel` on screen.
@@ -65,7 +81,18 @@ pub fn Guide() -> impl IntoElement {
     let focus = signal(Focus::at(now_minute()));
     let first = signal(0usize);
     let playing = signal(None::<usize>);
+    // Each zap opens the stream again: a new token.
+    let zaps = signal(0u32);
+    let paused = signal(false);
+    let state = signal(String::from("idle"));
+    let query = signal(String::new());
+    let search = element_ref();
 
+    let play = move |channel: usize| {
+        playing.set(Some(channel));
+        zaps.update(|z| *z += 1);
+        paused.set(false);
+    };
     let on_key = move |event: &KeyEvent| {
         let step = match &*event.key {
             "ArrowUp" => Some(Move::Up),
@@ -81,22 +108,27 @@ pub fn Guide() -> impl IntoElement {
             return;
         }
         match &*event.key {
-            "Enter" => {
-                let channel = focus.with_untracked(|f| f.channel);
-                playing.set(Some(channel));
-                nsh_platform_tizen::host(&format!(r#"{{"play":{channel}}}"#));
-            }
+            "Enter" => play(focus.with_untracked(|f| f.channel)),
             "ChannelUp" | "ChannelDown" => {
                 let delta: isize = if &*event.key == "ChannelUp" { -1 } else { 1 };
                 let count = schedule().channel_count() as isize;
                 let from = playing.get_untracked().unwrap_or(0) as isize;
-                let to = (from + delta).rem_euclid(count) as usize;
-                playing.set(Some(to));
-                nsh_platform_tizen::host(&format!(r#"{{"play":{to}}}"#));
+                play((from + delta).rem_euclid(count) as usize);
             }
+            "MediaPlayPause" | "MediaPause" | "MediaPlay" => paused.update(|p| *p = !*p),
+            "MediaStop" => playing.set(None),
+            "ColorF0Red" => search.focus(),
             "GoBack" => nsh_platform_tizen::host(r#"{"exit":true}"#),
             _ => {}
         }
+    };
+    let source = move || match playing.get() {
+        Some(c) => serde_json::json!({
+            "url": STREAMS[c % STREAMS.len()],
+            "token": zaps.get(),
+            "live": true,
+        }),
+        None => serde_json::Value::Null,
     };
 
     view()
@@ -107,7 +139,27 @@ pub fn Guide() -> impl IntoElement {
         .w(px(1920.0))
         .h(px(1080.0))
         .on_key_down(on_key)
-        .child(header(focus, playing))
+        .child(
+            // The video under the preview's outline; the page draws nothing
+            // here (AVPlay's plane shows through).
+            native("tv.player")
+                .absolute()
+                .left(px(1184.0))
+                .top(px(32.0))
+                .w(px(704.0))
+                .h(px(396.0))
+                .prop("source", source)
+                .prop("paused", move || serde_json::json!(paused.get()))
+                .on_native_event(move |e: &NativeEvent| match &*e.name {
+                    "state" => state.set(e.data["state"].as_str().unwrap_or("?").to_owned()),
+                    "error" => {
+                        state.set(format!("error {}", e.data["code"].as_str().unwrap_or("?")))
+                    }
+                    "size" => state.set(format!("{}×{}", e.data["width"], e.data["height"])),
+                    _ => {}
+                }),
+        )
+        .child(header(focus, playing, state, paused, query, search))
         .child(ruler(focus))
         .child(
             view()
@@ -123,7 +175,15 @@ pub fn Guide() -> impl IntoElement {
 
 /// The focused channel and program over the left of the screen; the right
 /// is a transparent frame the TV's video plane shows through.
-fn header(focus: Signal<Focus>, playing: Signal<Option<usize>>) -> impl IntoElement {
+fn header(
+    focus: Signal<Focus>,
+    playing: Signal<Option<usize>>,
+    state: Signal<String>,
+    paused: Signal<bool>,
+    query: Signal<String>,
+    search: ElementRef,
+) -> impl IntoElement {
+    let logo = signal(String::new());
     let focused = computed(move || {
         let f = focus.get();
         (f.channel, f.program(&schedule()))
@@ -144,6 +204,45 @@ fn header(focus: Signal<Focus>, playing: Signal<Option<usize>>) -> impl IntoElem
                 .bg(rgb(PANEL))
                 .px(px(56.0))
                 .pt(px(48.0))
+                .child(
+                    image("asset:/logo.png")
+                        .absolute()
+                        .right(px(56.0))
+                        .top(px(40.0))
+                        .w(px(72.0))
+                        .h(px(72.0))
+                        .on_load(move |s: &Size<DevicePixels>| {
+                            logo.set(format!("logo {}×{}", s.width.0, s.height.0))
+                        })
+                        .on_error(move |m: &str| logo.set(format!("logo failed: {m}"))),
+                )
+                .child(
+                    text(move || logo.get())
+                        .absolute()
+                        .right(px(40.0))
+                        .top(px(118.0))
+                        .text_size(px(18.0))
+                        .text_color(rgb(MUTED)),
+                )
+                .child(
+                    nsh_core::element::input()
+                        .element_ref(&search)
+                        .absolute()
+                        .left(px(56.0))
+                        .top(px(352.0))
+                        .w(px(560.0))
+                        .h(px(52.0))
+                        .px(px(16.0))
+                        .rounded(px(8.0))
+                        .bg(rgb(ALT))
+                        .text_size(px(26.0))
+                        .text_color(rgb(TEXT))
+                        .placeholder("Red: search channels")
+                        .placeholder_color(rgb(MUTED))
+                        .value(move || query.get())
+                        .on_change(move |t: &str| query.set(t.to_owned()))
+                        .on_submit(move |t: &str| query.set(format!("{t} ✓"))),
+                )
                 .child(
                     text(move || schedule().channel_name(focused.get().0))
                         .text_size(px(30.0))
@@ -192,7 +291,12 @@ fn header(focus: Signal<Focus>, playing: Signal<Option<usize>>) -> impl IntoElem
                 .border_color(rgb(ALT))
                 .child(
                     text(move || match playing.get() {
-                        Some(c) => schedule().channel_name(c),
+                        Some(c) => format!(
+                            "{} · {}{}",
+                            schedule().channel_name(c),
+                            state.get(),
+                            if paused.get() { " · paused" } else { "" }
+                        ),
                         None => "OK plays the focused channel here".to_owned(),
                     })
                     .absolute()
@@ -287,7 +391,11 @@ fn row(
                         .top(px(16.0))
                         .text_size(px(28.0))
                         .text_color(move || {
-                            rgb(if playing.get() == Some(channel.get()) { LIGHT } else { TEXT })
+                            rgb(if playing.get() == Some(channel.get()) {
+                                LIGHT
+                            } else {
+                                TEXT
+                            })
                         }),
                 ),
         )
@@ -309,7 +417,10 @@ fn cell(
         program().map_or((0.0, 0.0), |p| {
             let start = p.start.max(window);
             let end = p.end.min(window + visible);
-            ((start - window) as f32 * scale, (end - start).max(0) as f32 * scale)
+            (
+                (start - window) as f32 * scale,
+                (end - start).max(0) as f32 * scale,
+            )
         })
     };
     let focused = move || program().is_some_and(|p| focused_start.get() == Some(p.start));
@@ -319,7 +430,13 @@ fn cell(
         .h(px(ROW_H - 12.0))
         .left(move || px(CHANNEL_W + geometry().0 + 3.0))
         .w(move || px((geometry().1 - 6.0).max(0.0)))
-        .opacity(move || if program().is_some() { 1.0_f32 } else { 0.0_f32 })
+        .opacity(move || {
+            if program().is_some() {
+                1.0_f32
+            } else {
+                0.0_f32
+            }
+        })
         .rounded(px(10.0))
         .px(px(14.0))
         .justify_center()
@@ -358,6 +475,7 @@ extern crate iptv_web;
 
 /// The UI sets: none, or with the ballast NSH's base components (all of
 /// them registered, as an app using `nsh/base` links them).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn ui_sets() -> Vec<nsh_core::element::Registry> {
     #[cfg(feature = "ballast")]
     return vec![nsh_base::registry()];
@@ -373,7 +491,11 @@ mod tests {
     use nsh_platform_tizen::{Device, Runtime};
 
     fn ops(pumped: &nsh_platform_tizen::Pumped) -> Vec<serde_json::Value> {
-        pumped.batches.iter().flat_map(|b| b.as_array().unwrap().clone()).collect()
+        pumped
+            .batches
+            .iter()
+            .flat_map(|b| b.as_array().unwrap().clone())
+            .collect()
     }
 
     #[test]
@@ -394,7 +516,13 @@ mod tests {
         let created = first.iter().filter(|op| op[0] == "c").count();
         let down = ops(&rt.key(listener, "ArrowDown", "ArrowDown", true, false));
         let right = ops(&rt.key(listener, "ArrowRight", "ArrowRight", true, false));
-        eprintln!("first render: {} ops, {} views; Down: {} ops; Right: {} ops", first.len(), created, down.len(), right.len());
+        eprintln!(
+            "first render: {} ops, {} views; Down: {} ops; Right: {} ops",
+            first.len(),
+            created,
+            down.len(),
+            right.len()
+        );
         assert!(created > 100);
         assert!(!down.is_empty() && down.len() < 200, "{}", down.len());
     }

@@ -1,6 +1,6 @@
 [package]
 name = "guide-spike"
-description = "Spike: a Patina-like guide over video, rendered by nsh-platform-tizen."
+description = "The Tizen platform's test app: a Patina-like guide over video."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 nsh-core.workspace = true
 nsh-platform-tizen = { path = "../nsh-platform-tizen" }
 iptv-core.workspace = true
+serde_json.workspace = true
 # Ballast (feature `ballast`): real code a Patina module would also carry,
 # to measure how compile and cached launches scale with module size.
 nsh-base = { workspace = true, optional = true }
@@ -21,6 +22,3 @@ iptv-web = { path = "../../../patina-iptv/crates/iptv-web", optional = true }
 [features]
 ballast = ["ballast-core", "dep:nsh-base"]
 ballast-core = ["dep:iptv-web"]
-
-[dev-dependencies]
-serde_json.workspace = true

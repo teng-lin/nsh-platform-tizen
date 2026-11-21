@@ -176,7 +176,7 @@ function NshEngine(options) {
      * module's size and a hash of its bytes.
      */
     E.compile = function (bytes) {
-        var M = this.M;
+        var M = this.M, self = this;
         var key = 'app-' + bytes.byteLength + '-' + quickHash(bytes);
         return idb().then(function (db) {
             return new Promise(function (ok) {
@@ -189,19 +189,21 @@ function NshEngine(options) {
             M.moduleFromCache = false;
             return WebAssembly.compile(bytes).then(function (module) {
                 if (!r.db) return module;
+                var report = function () { self.out({ t: 'metrics', m: M }); };
+                /* Older builds' modules go first, in a transaction of their
+                 * own: a compiled module takes about 2.6 times its file's
+                 * size, and the quota (88 MB on a 2020 set) counts them
+                 * until their deletion commits. */
                 try {
-                    var tx = r.db.transaction('modules', 'readwrite');
-                    var store = tx.objectStore('modules');
-                    store.openCursor().onsuccess = function (e) {
-                        var c = e.target.result;
-                        if (!c) { store.put(module, key); return; }
-                        if (c.key !== key) c.delete();
-                        c.continue();
+                    var clear = r.db.transaction('modules', 'readwrite');
+                    clear.objectStore('modules').clear();
+                    clear.oncomplete = clear.onerror = clear.onabort = function () {
+                        var tx = r.db.transaction('modules', 'readwrite');
+                        var w0 = performance.now();
+                        try { tx.objectStore('modules').put(module, key); } catch (err) { M.moduleCached = 'put: ' + err; report(); return; }
+                        tx.oncomplete = function () { M.moduleCached = true; M.cacheWriteMs = Math.round(performance.now() - w0); report(); };
+                        tx.onabort = function () { M.moduleCached = 'abort ' + tx.error; report(); };
                     };
-                    var w0 = performance.now();
-                    tx.oncomplete = function () { M.moduleCached = true; M.cacheWriteMs = Math.round(performance.now() - w0); };
-                    tx.onerror = function () { M.moduleCached = 'error ' + tx.error; };
-                    tx.onabort = function () { M.moduleCached = 'abort ' + tx.error; };
                 } catch (e) { M.moduleCached = 'refused: ' + e; }
                 return module;
             });

@@ -43,6 +43,13 @@ pub(crate) enum Route {
     Drop,
 }
 
+/// A key held down.
+struct Held {
+    route: Route,
+    /// The last down's target and its ancestors then, nearest first.
+    reached: Vec<u32>,
+}
+
 #[derive(Default)]
 pub(crate) struct Routes {
     parent: HashMap<u32, u32>,
@@ -57,9 +64,9 @@ pub(crate) struct Routes {
     pub(crate) editing: Option<u32>,
     /// Focus transitions to report: view, focused.
     pub(crate) transitions: Vec<(u32, bool)>,
-    /// Each held key's route, so its repeats and release go where its
-    /// press went.
-    held: HashMap<u32, Route>,
+    /// Each held key: its route's family and the views its last down
+    /// reached (the target, then its ancestors), for the release.
+    held: HashMap<u32, Held>,
 }
 
 impl Routes {
@@ -253,25 +260,55 @@ impl Routes {
     ) -> Route {
         if down {
             let route = match self.held.get(&code) {
-                Some(&held) if repeat => self.still(held),
+                // A held OK stays on the pressed view while it is there
+                // (it pressed once; its repeats are its keys).
+                Some(held)
+                    if repeat && matches!(held.route, Route::Press(id) if self.attached(id)) =>
+                {
+                    held.route
+                }
+                // A key's auto-repeat goes where keys go now (a list's
+                // items each moving the focus on), as NSH's web and macOS
+                // backends pick its view per event.
+                Some(_) if repeat => match self.fresh(false, requested) {
+                    Route::Press(id) => Route::Key(id),
+                    route => route,
+                },
                 _ => self.fresh(enter, requested),
             };
-            self.held.insert(code, route);
+            let reached = match route {
+                Route::Key(id) | Route::Press(id) => self.ancestry(id),
+                Route::Drop => Vec::new(),
+            };
+            self.held.insert(code, Held { route, reached });
             return route;
         }
-        match self.held.remove(&code) {
-            Some(held) => self.still(held),
-            None => Route::Drop,
+        let Some(held) = self.held.remove(&code) else {
+            return Route::Drop;
+        };
+        // The release goes to the last down's view, or, if it left, to the
+        // nearest view that heard that down and is still there; never to a
+        // view that heard no down.
+        let Some(&to) = held.reached.iter().find(|v| self.attached(**v)) else {
+            return Route::Drop;
+        };
+        match held.route {
+            Route::Press(id) if id == to => Route::Press(id),
+            _ => Route::Key(to),
         }
     }
 
-    /// A held route, its family kept: to the same view, or where keys go
-    /// now if that view left the tree (a press then no longer presses).
-    fn still(&self, held: Route) -> Route {
-        match held {
-            Route::Key(id) | Route::Press(id) if !self.attached(id) => Route::Key(self.target()),
-            route => route,
+    /// `id` and its ancestors, nearest first.
+    fn ancestry(&self, mut id: u32) -> Vec<u32> {
+        let mut out = vec![id];
+        while let Some(&p) = self.parent.get(&id) {
+            if out.len() > 10_000 {
+                break;
+            }
+            out.push(p);
+            id = p;
         }
+        out
     }
 
     /// The focused-state bits to report for a view going to `focused`:
@@ -421,27 +458,34 @@ mod tests {
     }
 
     #[test]
-    fn repeats_follow_their_press_and_lone_releases_drop() {
+    fn repeats_follow_the_focus_and_releases_their_downs() {
         let mut r = tree();
         focus(&mut r, 4);
-        assert_eq!(r.route(417, false, true, false, 0), Route::Key(4));
+        assert_eq!(r.route(40, false, true, false, 0), Route::Key(4));
+        // Held Down: each repeat goes where the focus is now.
         focus(&mut r, 3);
+        assert_eq!(r.route(40, false, true, true, 0), Route::Key(3));
         assert_eq!(
-            r.route(417, false, true, true, 0),
-            Route::Key(4),
-            "a repeat follows its press"
+            r.route(40, false, false, false, 0),
+            Route::Key(3),
+            "to the last down's view"
         );
-        assert_eq!(r.route(417, false, false, false, 0), Route::Key(4));
         assert_eq!(
-            r.route(417, false, false, false, 0),
+            r.route(40, false, false, false, 0),
             Route::Drop,
             "no press held"
         );
-        // The pressed view left the tree: its release goes where keys go.
+        // The view the down reached left: the release goes to the nearest
+        // ancestor that heard it, never to a view that heard none.
         assert_eq!(r.route(417, false, true, false, 0), Route::Key(3));
         r.apply(&MountItem::Remove { id: 3 });
         r.end_batch();
-        assert_eq!(r.route(417, false, false, false, 0), Route::Key(ROOT_ID));
+        focus(&mut r, 4);
+        assert_eq!(
+            r.route(417, false, false, false, 0),
+            Route::Key(2),
+            "3's parent, not 4"
+        );
     }
 
     #[test]
@@ -454,12 +498,23 @@ mod tests {
             Route::Press(3),
             "a repeat is the press's"
         );
-        // The pressed view goes: the release is a key where keys go now,
-        // never a press of another view.
+        assert_eq!(r.route(13, true, false, false, 0), Route::Press(3));
+        // The pressed view goes: the release is a key for the nearest view
+        // that heard the down, never a press of another.
+        assert_eq!(r.route(13, true, true, false, 0), Route::Press(3));
         r.apply(&MountItem::Remove { id: 3 });
         r.end_batch();
         focus(&mut r, 4);
-        assert_eq!(r.route(13, true, false, false, 0), Route::Key(4));
+        assert_eq!(r.route(13, true, false, false, 0), Route::Key(2));
+        // Its whole branch gone: the root heard it.
+        assert_eq!(
+            r.route(13, true, true, false, 0),
+            Route::Key(4),
+            "4 takes no presses"
+        );
+        r.apply(&MountItem::Remove { id: 2 });
+        r.end_batch();
+        assert_eq!(r.route(13, true, false, false, 0), Route::Key(ROOT_ID));
     }
 
     #[test]

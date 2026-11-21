@@ -1622,6 +1622,55 @@ mod tests {
         assert_eq!(pumped.next, Some(0.0));
     }
 
+    #[component]
+    fn Items() -> impl IntoElement {
+        let refs = [element_ref(), element_ref(), element_ref(), element_ref()];
+        let at = signal(0usize);
+        view()
+            .on_key_down(move |e: &KeyEvent| {
+                if &*e.key == "1" {
+                    refs[0].focus();
+                }
+            })
+            .children((0..4).map(move |i| {
+                view()
+                    .element_ref(&refs[i])
+                    .focusable(true)
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    // Each item moves the focus to the next on Down.
+                    .on_key_down(move |e: &KeyEvent| {
+                        if &*e.key == "ArrowDown" && i + 1 < 4 {
+                            refs[i + 1].focus();
+                            at.set(i + 1);
+                        }
+                    })
+            }))
+            .child(text(move || format!("at {}", at.get())))
+    }
+
+    /// Holding Down on items that each move the focus on: every repeat
+    /// reaches the item focused now, so the focus walks the list.
+    #[test]
+    fn a_held_key_walks_items_that_move_the_focus() {
+        let (mut runtime, _) = start(Root::of::<Items>());
+        runtime.remote_key(0, 49, "1", "", true, false);
+        runtime.remote_key(0, 49, "1", "", false, false);
+        assert_eq!(
+            texts(&runtime.remote_key(0, 40, "", "", true, false)),
+            ["at 1"]
+        );
+        assert_eq!(
+            texts(&runtime.remote_key(0, 40, "", "", true, true)),
+            ["at 2"]
+        );
+        assert_eq!(
+            texts(&runtime.remote_key(0, 40, "", "", true, true)),
+            ["at 3"]
+        );
+        runtime.remote_key(0, 40, "", "", false, false);
+    }
+
     #[test]
     fn the_platform_reports_its_own_name() {
         let environment = Device::default().environment();

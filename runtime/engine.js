@@ -7,14 +7,16 @@
  *
  * Messages it sends: {t:'ops', batches:[JSON text...], seq?, engineMs?},
  * {t:'frame'}, {t:'host', m}, {t:'font', family, weight, italic, data},
- * {t:'imageBytes', uri, type, data}, {t:'keys', rows}, {t:'error', text,
- * dead?}, {t:'log', level, text}, {t:'metrics', m}.
+ * {t:'imageBytes', uri, type, data}, {t:'keys', rows}, {t:'error', text},
+ * {t:'fatal', text}, {t:'log', level, text}, {t:'metrics', m}.
  *
  * Failures stay contained: an exception thrown by any import (the
  * platform's or a host's) is caught and reported, never unwound through
  * the module's Rust frames, which would leave its state borrowed. A trap
- * in the module (a Rust panic aborts) marks the engine dead: one error is
- * reported with its stack and nothing calls into the module again.
+ * in the module (a Rust panic aborts) is fatal, once: the panic's message
+ * and the trap's stack go out in one {t:'fatal'}, output not yet sent is
+ * dropped, timers stop, and nothing calls into the module again. Hosts'
+ * hooks get the exports wrapped the same way (`NshTizenWorker.onInstance`).
  *
  * Plain ES2017 (Chromium 69). No 64-bit integer crosses into the module.
  */
@@ -35,7 +37,10 @@ var NshTizenWorker = (function () {
             for (var k in functions) extra[name][k] = functions[k];
         },
         /* `f(exports, engine)` once the module is instantiated, before the
-         * app starts: for imports that read the module's memory. */
+         * app starts: for imports that read the module's memory. `exports`
+         * holds every function wrapped (a trap is the engine's fatal
+         * error, a call during a pump is queued by the module) and
+         * `memory`. */
         onInstance: function (f) { ready.push(f); },
         extra: extra,
         ready: ready
@@ -65,32 +70,80 @@ function NshEngine(options) {
      * Calls export `name` of the module: after a trap, never again (its
      * memory may hold a borrowed state). Returns undefined when dead.
      */
-    E.call = function (name) {
+    E.call = function (name, a, b, c, d, e, f, g, h) {
         if (this.dead || !this.ex) return undefined;
         try {
-            return this.ex[name].apply(null, Array.prototype.slice.call(arguments, 1));
-        } catch (e) {
-            this.dead = true;
-            this.M.dead = name + ': ' + String(e && e.stack || e);
-            this.out({ t: 'error', dead: true, text: 'the app stopped in ' + name + ': ' + String(e && e.stack || e) });
-            this.out({ t: 'metrics', m: this.M });
+            return this.ex[name](a, b, c, d, e, f, g, h);
+        } catch (err) {
+            this.fatal('the app stopped in ' + name + ': ' + String(err && err.stack || err));
             return undefined;
         }
     };
 
-    /* An import's body, guarded: a throw is reported, the module gets 0. */
+    /*
+     * The engine's one fatal transition: reported once (with a panic's
+     * message, which the panic hook sent just before the trap), output not
+     * yet sent dropped, timers stopped, the module never called again.
+     */
+    E.fatal = function (text) {
+        if (this.dead) return;
+        this.dead = true;
+        this.pending = [];
+        this.halt();
+        var full = (this.panic ? this.panic + '\n' : '') + text;
+        this.M.dead = full.slice(0, 2000);
+        this.out({ t: 'fatal', text: full });
+        this.out({ t: 'metrics', m: this.M });
+    };
+
+    /* Stops the engine's timers (a fatal error, or the session ended). */
+    E.halt = function () {
+        clearTimeout(this.pumpTimer);
+        clearTimeout(this.wakeTimer);
+        this.pumpTimer = null;
+        this.wakeTimer = null;
+        this.halted = true;
+    };
+
+    /*
+     * An import's body, guarded: a throw is reported (the same one once,
+     * then counted) and the module gets 0. A trap from inside the module
+     * (an import calling an export that trapped) is fatal and goes on
+     * unwinding: the module's frames must not continue. Fixed arity, no
+     * `arguments`: measure_text and submit run thousands of times a key.
+     */
     E.guard = function (name, f) {
         var self = this;
-        return function () {
-            try {
-                return f.apply(null, arguments);
-            } catch (e) {
-                var text = name + ': ' + String(e && e.stack || e);
-                if (self.M.importErrors.length < 20) self.M.importErrors.push(text.slice(0, 500));
-                self.out({ t: 'error', text: 'an import threw: ' + text });
-                return 0;
+        var report = function (e) {
+            if ((typeof WebAssembly !== 'undefined' && e instanceof WebAssembly.RuntimeError) || self.dead) {
+                self.fatal('the app stopped in ' + name + ': ' + String(e && e.stack || e));
+                throw e;
             }
+            var text = name + ': ' + String(e && e.stack || e);
+            var seen = self.M.importErrors;
+            for (var i = 0; i < seen.length; i++) if (seen[i].text === text) { seen[i].count++; return 0; }
+            if (seen.length < 20) seen.push({ text: text.slice(0, 500), count: 1 });
+            self.out({ t: 'error', text: 'an import threw: ' + text });
+            return 0;
         };
+        if (f.length > 8) {
+            return function () {
+                try { return f.apply(null, arguments); } catch (e) { return report(e); }
+            };
+        }
+        return function (a, b, c, d, e, g, h, i) {
+            try { return f(a, b, c, d, e, g, h, i); } catch (err) { return report(err); }
+        };
+    };
+
+    /* The exports a host's hooks get: every function through `call`. */
+    E.wrapped = function () {
+        var self = this, out = { memory: this.ex.memory };
+        Object.keys(this.ex).forEach(function (name) {
+            if (typeof self.ex[name] !== 'function') return;
+            out[name] = function (a, b, c, d, e, f, g, h) { return self.call(name, a, b, c, d, e, f, g, h); };
+        });
+        return out;
     };
 
     E.str = function (ptr, len) { return this.decoder.decode(new Uint8Array(this.ex.memory.buffer, ptr, len)); };
@@ -115,6 +168,7 @@ function NshEngine(options) {
 
     /* What the engine committed during this turn, to the page at once. */
     E.flush = function (extra) {
+        if (this.dead) return;
         if (!this.pending.length && !extra) return;
         var msg = { t: 'ops', batches: this.pending };
         if (extra) for (var k in extra) msg[k] = extra[k];
@@ -122,11 +176,24 @@ function NshEngine(options) {
         this.out(msg);
     };
 
+    /* A message that must reach the page in order with the batches around
+     * it (an image's bytes before the batch that shows it, after the one
+     * that released the same URI): the batches before it go first. */
+    E.queueOut = function (message, transfer) {
+        if (this.dead) return;
+        if (this.pending.length) {
+            this.out({ t: 'ops', batches: this.pending });
+            this.pending = [];
+        }
+        this.out(message, transfer);
+    };
+
     /* Runs what is due: from the engine's timer, a wake, or a host's
      * script after an async reply it gave the module. */
     E.pump = function () {
+        clearTimeout(this.pumpTimer);
         this.pumpTimer = null;
-        if (this.ex && !this.dead) { this.call('nsh_tz_pump'); this.flush(); }
+        if (this.ex && !this.dead && !this.halted) { this.call('nsh_tz_pump'); this.flush(); }
     };
 
     E.imports = function () {
@@ -137,16 +204,19 @@ function NshEngine(options) {
                 request_frame: function () { self.out({ t: 'frame' }); },
                 schedule: function (ms) {
                     clearTimeout(self.pumpTimer);
-                    self.pumpTimer = ms >= 0 ? setTimeout(function () { self.pump(); }, ms) : null;
+                    self.pumpTimer = ms >= 0 && !self.halted ? setTimeout(function () { self.pump(); }, ms) : null;
                 },
                 /* Work arrived outside a pump (LocalEngine::set_wake): a
                  * timer of its own, which `schedule` does not cancel. */
                 wake: function () {
-                    if (self.wakeTimer !== null) return;
+                    if (self.wakeTimer !== null || self.halted) return;
                     self.wakeTimer = setTimeout(function () { self.wakeTimer = null; self.pump(); }, 0);
                 },
                 report_error: function (ptr, len) {
                     var text = self.str(ptr, len);
+                    /* The panic hook's message: the trap that follows is
+                     * reported with it, once. */
+                    if (text.indexOf('nsh panicked') === 0) { self.panic = text; return; }
                     self.out({ t: 'error', text: text });
                 },
                 measure_text: function (fptr, flen, tptr, tlen) {
@@ -164,7 +234,7 @@ function NshEngine(options) {
                 },
                 image_bytes: function (up, ul, tp, tl, dp, dl) {
                     var data = self.bytes(dp, dl);
-                    self.out({ t: 'imageBytes', uri: self.str(up, ul), type: self.str(tp, tl), data: data }, [data]);
+                    self.queueOut({ t: 'imageBytes', uri: self.str(up, ul), type: self.str(tp, tl), data: data }, [data]);
                 },
                 remote_keys: function (ptr, len) { self.out({ t: 'keys', rows: JSON.parse(self.str(ptr, len)) }); }
             },
@@ -332,16 +402,27 @@ function NshEngine(options) {
             return attempt(false);
         }).then(function (instance) {
             self.ex = instance.exports;
+            var hooks = self.wrapped();
             NshTizenWorker.ready.forEach(function (f) {
-                try { f(self.ex, self); } catch (e) { self.out({ t: 'error', text: 'onInstance threw: ' + (e && e.stack || e) }); }
+                try { f(hooks, self); } catch (e) { self.out({ t: 'error', text: 'onInstance threw: ' + (e && e.stack || e) }); }
             });
             self.call('nsh_tz_init');
             var s0 = performance.now();
             var started = self.call('nsh_tz_start', device.width, device.height, device.pixelRatio || 1, device.dark ? 1 : 0, 5);
             M.startMs = Math.round(performance.now() - s0);
-            M.started = started === 1;
+            M.started = started === 1 && !self.dead;
+            if (self.dead) {
+                /* Reported as fatal already. */
+                var stopped = new Error('the app stopped while starting');
+                stopped.reported = true;
+                throw stopped;
+            }
+            if (!M.started) {
+                self.pending = [];
+                throw new Error('the app did not start (see its errors)');
+            }
+            /* The first batches are marked as the first paint only now. */
             self.flush({ first: true });
-            if (!M.started) throw new Error(self.dead ? 'the app stopped while starting' : 'the app did not start (see its errors)');
             return M;
         });
     };

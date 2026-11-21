@@ -44,7 +44,7 @@
     /* A host callback, isolated: its throw is reported, not fatal. */
     function hostCall(session, name, f) {
         try { return f(); } catch (e) {
-            session.M.errors.push((name + ' threw: ' + String(e && e.stack || e)).slice(0, 500));
+            session.note(name + ' threw: ' + String(e && e.stack || e));
             return undefined;
         }
     }
@@ -59,6 +59,8 @@
         this.frameAsked = false;
         this.lastBack = -1e9;
         this.ended = false;
+        this.halted = false;   /* the app stopped (a fatal error) */
+        this.saveTimer = null;
         this.recorded = null;
         this.listeners = [];
         this.worker = null;
@@ -72,7 +74,15 @@
 
     var S = Session.prototype;
 
+    /* At most every 2 s: an error repeating every pump must not rewrite
+     * localStorage each time. */
     S.saveMetrics = function () {
+        var self = this;
+        if (this.saveTimer !== null) return;
+        this.saveTimer = setTimeout(function () { self.saveTimer = null; self.saveNow(); }, 2000);
+    };
+
+    S.saveNow = function () {
         var M = this.M;
         try {
             var all = JSON.parse(localStorage.getItem('nsh.metrics') || '[]');
@@ -89,17 +99,53 @@
 
     /* A message to the engine (dropped once the session ended). */
     S.send = function (m) {
-        if (this.ended || !this.engineSend) return;
+        if (this.ended || this.halted || !this.engineSend) return;
         this.engineSend(m);
     };
 
-    S.error = function (text) {
-        var self = this, M = this.M;
-        M.errors.push(String(text).slice(0, 500));
-        if (M.errors.length > 20) M.errors.shift();
-        if (typeof console !== 'undefined') console.error(text);
-        if (this.options.onError) hostCall(this, 'onError', function () { self.options.onError(text); });
+    /*
+     * Records `text` in __nsh.errors: the same text once, then counted
+     * (__nsh.errorCounts); at most 20 kept. True the first time.
+     */
+    S.note = function (text) {
+        var M = this.M;
+        text = String(text).slice(0, 500);
+        M.errorCounts = M.errorCounts || {};
+        if (M.errorCounts[text]) { M.errorCounts[text]++; return false; }
+        M.errorCounts[text] = 1;
+        M.errors.push(text);
+        if (M.errors.length > 20) delete M.errorCounts[M.errors.shift()];
         this.saveMetrics();
+        return true;
+    };
+
+    /* An error for the host: noted, and told to onError the first time. */
+    S.error = function (text) {
+        if (!this.note(text)) return;
+        if (typeof console !== 'undefined') console.error(text);
+        if (this.options.onError) {
+            try { this.options.onError(text); } catch (e) { this.note('onError threw: ' + String(e && e.stack || e)); }
+        }
+    };
+
+    /*
+     * The app stopped (a trap, or a start that failed): one report, then
+     * nothing of it runs on: its native components are destroyed (a player
+     * closes), input stops, frames stop, waiting callbacks go. The last
+     * frame stays on screen.
+     */
+    S.fatal = function (text) {
+        if (this.halted) return;
+        this.halted = true;
+        this.M.dead = true;
+        this.listeners.forEach(function (l) { l[0].removeEventListener(l[1], l[2]); });
+        this.listeners = [];
+        this.waiting = {};
+        if (this.engine) this.engine.halt();
+        if (this.worker) this.worker.terminate();
+        this.renderer.haltComponents();
+        this.error(text);
+        this.saveNow();
     };
 
     S.registerKeys = function () {
@@ -115,7 +161,7 @@
 
     /* What the engine sent. */
     S.receive = function (m) {
-        if (this.ended) return;
+        if (this.ended || this.halted) return;
         var self = this, M = this.M, renderer = this.renderer;
         switch (m.t) {
         case 'ops': {
@@ -158,10 +204,8 @@
                 hostCall(this, 'onHost', function () { self.options.onHost(message); });
             }
             break;
-        case 'error':
-            if (m.dead) M.dead = true;
-            this.error(m.text);
-            break;
+        case 'error': this.error(m.text); break;
+        case 'fatal': this.fatal(m.text); break;
         case 'log':
             M.logs.push(m.text.slice(0, 300));
             if (M.logs.length > 50) M.logs.shift();
@@ -199,29 +243,50 @@
      */
     S.key = function (e, down) {
         var code = e.keyCode;
-        var renderer = this.renderer, swallowed = renderer.swallowed;
-        if (!down && swallowed[code]) { delete swallowed[code]; e.preventDefault(); return; }
-        if (down && swallowed[code] && e.repeat) { e.preventDefault(); return; }
+        var keys = this.renderer.keys;
         var known = this.keyCodes[code];
-        if (code === 10009 && down && !e.repeat) {
+        var held = keys[code];
+        if (!down) {
+            /* A release follows its press; one without a press (it went
+             * down before the app, or in another page) is nobody's. */
+            delete keys[code];
+            if (held === 'app') return this.sendKey(e, false, code);
+            if (held === 'swallowed' || known) e.preventDefault();
+            return;
+        }
+        if (e.repeat && held) {
+            if (held === 'app') return this.sendKey(e, true, code);
+            if (held === 'swallowed') e.preventDefault();
+            return;
+        }
+        /* A fresh press decides its disposition (a stale one is gone). */
+        var disposition = this.dispose(e, code, known);
+        keys[code] = disposition;
+        if (disposition === 'app') this.sendKey(e, true, code);
+        else if (disposition === 'swallowed' || known) e.preventDefault();
+    };
+
+    /* What a fresh press is: the app's, the TV keyboard's, or swallowed
+     * (a bounced Back; Back leaving the input). */
+    S.dispose = function (e, code, known) {
+        if (code === 10009) {
             var now = performance.now();
             var bounced = now - this.lastBack < (this.options.backDebounceMs || 0);
             this.lastBack = now;
-            if (bounced) { swallowed[code] = true; e.preventDefault(); return; }
+            if (bounced) return 'swallowed';
         }
-        var editing = renderer.editing;
+        var editing = this.renderer.editing;
         if (editing) {
-            /* Back leaves the input: the keyboard closes, the app sees no
-             * key (its release included). */
-            if (code === 10009) {
-                if (down) { swallowed[code] = true; editing.input.el.blur(); }
-                e.preventDefault();
-                return;
-            }
-            /* The TV keyboard keeps its own keys. */
-            if ((known && known[4]) || code === api.IME_DONE || code === api.IME_CANCEL) return;
+            if (code === 10009) { editing.input.el.blur(); return 'swallowed'; }
+            if ((known && known[4]) || code === api.IME_DONE || code === api.IME_CANCEL) return 'browser';
         }
+        return 'app';
+    };
+
+    S.sendKey = function (e, down, code) {
+        var known = this.keyCodes[code];
         if (known) e.preventDefault();
+        var editing = this.renderer.editing;
         var self = this, M = this.M;
         var t0 = performance.now();
         var s = ++this.seq;
@@ -236,8 +301,7 @@
             };
         }
         this.send({ t: 'key', id: editing ? editing.id : 0, keyCode: code, key: typeof e.key === 'string' ? e.key : '',
-            code: typeof e.code === 'string' ? e.code : '', down: down ? 1 : 0, repeat: e.repeat ? 1 : 0, seq: s });
-        if (!down) delete self.waiting[s];
+            code: typeof e.code === 'string' ? e.code : '', down: down ? 1 : 0, repeat: e.repeat ? 1 : 0, seq: down ? s : undefined });
     };
 
     /* Frame gaps over 50 ms while the app runs. */
@@ -245,7 +309,7 @@
         var self = this, M = this.M;
         (function watch(last) {
             requestAnimationFrame(function (now) {
-                if (self.ended) return;
+                if (self.ended || self.halted) return;
                 if (last && now - last > 50) { M.gaps.push(Math.round(now - last)); if (M.gaps.length > 300) M.gaps.shift(); }
                 watch(now);
             });
@@ -276,12 +340,15 @@
                 });
             };
             engine.start(module, device, options.version).then(function () {
+                if (self.ended) return;
                 M.engine = engine.M;
                 self.saveMetrics();
             }, function (err) {
+                /* An ended session tells its host nothing more; a trap was
+                 * reported as fatal already. */
+                if (self.ended || (err && err.reported)) return;
                 M.fatal = String(err);
-                self.error('could not start: ' + err);
-                self.container.textContent = 'Could not start: ' + err;
+                self.fatal('could not start: ' + err);
             });
         } else {
             var worker = this.worker = new Worker(absolute(options.worker || 'nsh-worker.js'));
@@ -293,7 +360,7 @@
             };
             this.engineSend = function (m) { worker.postMessage(m); };
             worker.postMessage({
-                t: 'init', module: module, version: options.version, device: device,
+                t: 'init', module: module, version: options.version, device: device, bench: !!api.benchBuild,
                 scripts: (options.scripts || []).map(absolute),
                 fonts: (options.fonts || []).map(function (f) { return { family: f.family, url: absolute(f.url), weight: f.weight, style: f.style }; })
             });
@@ -321,6 +388,8 @@
         this.listeners.forEach(function (l) { l[0].removeEventListener(l[1], l[2]); });
         this.listeners = [];
         if (this.worker) this.worker.terminate();
+        if (this.engine) this.engine.halt();
+        clearTimeout(this.saveTimer);
         this.renderer.dispose();
         this.waiting = {};
     };
@@ -344,22 +413,6 @@
     api.record = function () { if (current) current.recorded = []; };
     api.recorded = function () { return current ? current.recorded : null; };
 
-    /* ---------- hooks for the benchmark (nsh-bench.js) ---------- */
-
-    var BENCH_CODES = { ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Enter: 13 };
-    api.benchKey = function (key, applied) {
-        var session = current, code = BENCH_CODES[key];
-        var s = ++session.seq;
-        session.waiting[s] = function () { applied(); };
-        session.send({ t: 'key', id: 0, keyCode: code, key: key, code: key, down: 1, repeat: 0, seq: s });
-        session.send({ t: 'key', id: 0, keyCode: code, key: key, code: key, down: 0, repeat: 0 });
-    };
-    api.setBenchLoad = function (on) {
-        var session = current;
-        if (session.worker) { session.worker.postMessage({ t: 'load', on: on }); return; }
-        clearInterval(api.pageLoad);
-        api.pageLoad = on ? setInterval(function () { var end = performance.now() + 30; while (performance.now() < end) { /* work */ } }, 50) : null;
-    };
-    api.stats = function (done) { current.waiting.stats = done; current.send({ t: 'stats' }); };
-    api.ready = function () { return !!(current && current.M.firstPaintAt); };
+    /* The running session, for nsh-bench.js (benchmark builds only). */
+    api.session = function () { return current; };
 })(NshTizen);

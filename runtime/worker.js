@@ -10,6 +10,7 @@
 'use strict';
 
 var nshEngine = null;
+var nshBench = false;
 var nshQueue = [];
 
 /* Background work an app would do here, for the benchmark: busy slices of
@@ -50,14 +51,18 @@ var nshFailed = false;
 function nshFail(engine, err) {
     nshFailed = true;
     nshQueue = [];
+    nshSetLoad(false);
+    /* A trap while starting was reported as the engine's fatal error. */
+    if (engine && engine.dead) return;
     var text = String(err && err.stack || err);
-    if (engine) { engine.M.fatal = text; nshPost({ t: 'metrics', m: engine.M }); }
-    nshPost({ t: 'error', dead: true, text: 'could not start: ' + text });
+    if (engine) { engine.M.fatal = text; engine.halt(); nshPost({ t: 'metrics', m: engine.M }); }
+    nshPost({ t: 'fatal', text: 'could not start: ' + text });
 }
 
 onmessage = function (e) {
     var m = e.data;
     if (m.t === 'init') {
+        nshBench = !!m.bench;
         var measure = null, engine = null;
         try {
             try { measure = new OffscreenCanvas(1, 1).getContext('2d'); } catch (err) { measure = null; }
@@ -80,8 +85,9 @@ onmessage = function (e) {
         }).catch(function (err) { nshFail(engine, err); });
         return;
     }
-    if (nshFailed) return;
-    if (m.t === 'load') { nshSetLoad(m.on); return; }
+    if (nshFailed || (nshEngine && nshEngine.dead)) { nshSetLoad(false); return; }
+    /* Benchmark builds only: the app's thread made busy on purpose. */
+    if (m.t === 'load') { if (nshBench) nshSetLoad(m.on); return; }
     if (m.t === 'metrics') { if (nshEngine) nshPost({ t: 'metrics', m: nshEngine.M }); return; }
     if (!nshEngine) {
         /* Input before the app started; bounded (a start takes seconds). */

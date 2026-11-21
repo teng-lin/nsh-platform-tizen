@@ -60,13 +60,19 @@ var NshTizen = (function () {
         return 'url("' + String(uri).replace(/["\\]/g, '\\$&').replace(/[\n\r\f]/g, ' ') + '")';
     }
 
-    /* Whether an <img> may load `uri`: the web, the package, in-memory
-     * images; no `javascript:` or other schemes. */
+    /*
+     * Whether an <img> may load `uri` (not an in-memory image's key, which
+     * the renderer maps to its blob): http(s), and the package's own files
+     * by a relative URL. No other scheme: `file:` would let a playlist's
+     * logo probe the TV's files, `javascript:` nothing good. Parsed as the
+     * browser parses it (leading spaces and tabs included).
+     */
     function imageAllowed(uri) {
-        var scheme = /^([a-z][a-z0-9+.-]*):/i.exec(uri);
-        if (!scheme) return true;
-        var s = scheme[1].toLowerCase();
-        return s === 'http' || s === 'https' || s === 'blob' || s === 'file' || (s === 'data' && /^data:image\//i.test(uri));
+        var url;
+        try { url = new URL(uri, document.baseURI); } catch (e) { return false; }
+        if (url.protocol === 'http:' || url.protocol === 'https:') return true;
+        /* Relative: resolved against the package's page. */
+        return !/^[\s\x00-\x1f]*[a-z][a-z0-9+.-]*:/i.test(uri) && url.protocol === new URL(document.baseURI).protocol;
     }
 
     /* ---------- the view tree ---------- */
@@ -105,8 +111,11 @@ var NshTizen = (function () {
         this.blobs = {};          /* in-memory image URI -> blob URL */
         this.autoFocus = null;
         this.disposed = false;
-        /* Keys an input consumed on the way down: their release is dropped. */
-        this.swallowed = {};
+        /* Each held key's disposition, decided at its press: 'app' (sent
+         * to the engine), 'swallowed' (an input or the page consumed it)
+         * or 'browser' (the TV keyboard's own). Its repeats and release
+         * follow it. */
+        this.keys = {};
         this.style = document.createElement('style');
         this.style.textContent =
             '@keyframes nsh-spin{to{transform:rotate(360deg)}}' +
@@ -358,8 +367,9 @@ var NshTizen = (function () {
     R.image = function (n, op) {
         var self = this;
         var src = op[2], fit = op[3], placeholder = op[4], blur = op[5], position = op[6], tint = op[7];
-        if (src && !imageAllowed(src)) { this.M.blockedImages = (this.M.blockedImages || 0) + 1; src = null; }
-        if (placeholder && !imageAllowed(placeholder)) placeholder = null;
+        var blocked = !!src && !this.blobs[src] && !imageAllowed(src);
+        if (blocked) { this.M.blockedImages = (this.M.blockedImages || 0) + 1; src = null; }
+        if (placeholder && !this.blobs[placeholder] && !imageAllowed(placeholder)) placeholder = null;
         if (!n.img) {
             var img = document.createElement('img');
             img.onload = function () {
@@ -400,6 +410,13 @@ var NshTizen = (function () {
         /* The element still loads the source under a mask, for its events. */
         if (tint) s.setProperty('display', 'none');
         var resolved = src ? this.src(src) : null;
+        if (blocked) {
+            /* Not loaded: the app hears it failed. */
+            im.src = null;
+            im.el.removeAttribute('src');
+            if (n.events & ERROR) this.send({ t: 'image', id: n.id, ok: 0, error: 'this image source is not allowed' });
+            return;
+        }
         if (im.src === resolved) return;
         im.src = resolved;
         if (resolved) {
@@ -421,6 +438,9 @@ var NshTizen = (function () {
         var self = this;
         var old = n.input;
         var el = document.createElement(multiline ? 'textarea' : 'input');
+        /* The type before the value and selection: an email or number
+         * input set after them would drop them. */
+        if (!multiline && old && old.config.type) el.type = old.config.type;
         el.className = 'nsh-in';
         el.id = 'nsh-in-' + n.id;
         var input = n.input = { el: el, config: old ? old.config : {}, count: old ? old.count : 0, box: old ? old.box : null, css: old ? old.css : '', swapping: false };
@@ -433,10 +453,11 @@ var NshTizen = (function () {
             if (!self.live(n) || n.input !== input) return;
             var submit = input.config.submit || 'blur';
             var code = e.keyCode;
-            /* Enter, or the TV keyboard's Done. */
+            /* Enter, or the TV keyboard's Done; held, it submits once. */
             if ((code === 13 || code === IME_DONE) && !(submit === 'newline' && code === 13)) {
                 e.preventDefault();
                 self.consume(e);
+                if (e.repeat) return;
                 self.send({ t: 'text', id: n.id, name: 'onSubmitEditing', text: el.value, count: input.count });
                 if (submit === 'blur') el.blur();
             } else if (code === IME_CANCEL) {
@@ -476,7 +497,7 @@ var NshTizen = (function () {
      * see it, nor its release. */
     R.consume = function (e) {
         e.stopPropagation();
-        this.swallowed[e.keyCode] = true;
+        this.keys[e.keyCode] = 'swallowed';
     };
 
     R.inputConfig = function (n, c) {
@@ -530,6 +551,9 @@ var NshTizen = (function () {
             return;
         }
         if (on && this.editing && this.editing !== n) this.editing.input.el.blur();
+        /* Blur on the root: whatever is focused, the input being edited
+         * included. */
+        if (!on && n.id === ROOT_ID && this.editing) this.editing.input.el.blur();
     };
 
     /* An input's Focus and Blur, and its focused state where the core
@@ -537,7 +561,9 @@ var NshTizen = (function () {
     R.inputFocus = function (n, on) {
         if (!this.live(n)) return;
         this.send({ t: 'focus', id: n.id, on: on ? 1 : 0 });
-        if (n.states & FOCUSED) this.send({ t: 'states', id: n.id, states: on ? FOCUSED : 0 });
+        /* Always: the core tracks FOCUSED for every view (focus-within,
+         * focus restore, culling). */
+        this.send({ t: 'states', id: n.id, states: on ? FOCUSED : 0 });
     };
 
     R.attached = function (n) {
@@ -608,18 +634,24 @@ var NshTizen = (function () {
         try { tizen.application.getCurrentApplication().exit(); } catch (e) { /* not a TV */ }
     };
 
+    /* The app stopped: its native components go (a player closes), the
+     * last frame stays on screen. */
+    R.haltComponents = function () {
+        var nodes = this.componentNodes.slice();
+        for (var i = 0; i < nodes.length; i++) {
+            var n = nodes[i], inst = n.comp.instance;
+            if (inst.destroy) this.guard(n, 'destroy', function () { inst.destroy(); });
+            n.comp = null;
+        }
+        this.componentNodes = [];
+        if (this.editing) this.editing.input.el.blur();
+    };
+
     /* Ends this renderer (a new session replaces it): components are
      * destroyed, the DOM and styles removed, blobs released. */
     R.dispose = function () {
         if (this.disposed) return;
-        for (var id in this.nodes) {
-            var n = this.nodes[id];
-            if (n.comp && n.comp.instance.destroy) {
-                var inst = n.comp.instance;
-                this.guard(n, 'destroy', function () { inst.destroy(); });
-            }
-        }
-        if (this.editing) this.editing.input.el.blur();
+        this.haltComponents();
         this.disposed = true;
         var root = this.nodes[ROOT_ID];
         if (root && root.el.parentNode) root.el.parentNode.removeChild(root.el);

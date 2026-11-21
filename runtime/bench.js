@@ -10,6 +10,26 @@
  * NshTizen.runBench(done).
  */
 (function (api) {
+    api.benchBuild = true;
+
+    /* The hooks the benchmark drives the running app with. */
+    var BENCH_CODES = { ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Enter: 13 };
+    api.benchKey = function (key, applied) {
+        var session = api.session(), code = BENCH_CODES[key];
+        var s = ++session.seq;
+        session.waiting[s] = function () { applied(); };
+        session.send({ t: 'key', id: 0, keyCode: code, key: key, code: key, down: 1, repeat: 0, seq: s });
+        session.send({ t: 'key', id: 0, keyCode: code, key: key, code: key, down: 0, repeat: 0 });
+    };
+    api.setBenchLoad = function (on) {
+        var session = api.session();
+        if (session.worker) { session.worker.postMessage({ t: 'load', on: on }); return; }
+        clearInterval(api.pageLoad);
+        api.pageLoad = on ? setInterval(function () { var end = performance.now() + 30; while (performance.now() < end) { /* work */ } }, 50) : null;
+    };
+    api.stats = function (done) { var session = api.session(); session.waiting.stats = done; session.send({ t: 'stats' }); };
+    api.ready = function () { var session = api.session(); return !!(session && session.M.firstPaintAt); };
+
     function run(done) {
         var M = api.metrics;
         var seqKeys = ['ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown',

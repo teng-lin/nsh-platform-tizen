@@ -25,10 +25,11 @@ is either NSH's own or one the host chooses.
 - `config.xml` privileges: `internet`, `tv.inputdevice`. A declared CSP
   switches Tizen from WARP to CSP mode. The one that works on the TV
   (the example app's): `default-src 'self'; script-src 'self' 'unsafe-eval';
-  style-src 'self' 'unsafe-inline'; img-src * blob: data:; font-src 'self'
-  blob: data:; media-src *; connect-src *; object-src 'self'; worker-src
-  'self' blob:`. The renderer needs inline styles, `blob:` images and fonts;
-  AVPlay needs `object-src`. Keep every script in a file: the policy allows
+  style-src 'self' 'unsafe-inline'; img-src * blob: data:; font-src 'self';
+  media-src *; connect-src *; object-src 'self'; worker-src 'self'` (with
+  `script-src 'unsafe-eval'` added only for a page-thread build). The
+  renderer needs inline styles and `blob:` images; AVPlay needs
+  `object-src`. Keep every script in a file: the policy allows
   no inline script.
 
 ## The host page
@@ -115,9 +116,15 @@ NshTizenWorker.onInstance(function (exports, engine) {
   `engine.pump()`) while the module runs. The call is queued and runs when
   the outer call ends, never re-entering the runtime. Don't rely on its
   effect being visible before your import returns.
-- Every import is wrapped: a throw is reported (`__nsh.engine.importErrors`)
-  and returns 0 to the module. A trap in the module (a panic) stops the
-  engine for good, and `onError` gets its stack.
+- Every import is wrapped: a throw is reported once (then counted,
+  `__nsh.engine.importErrors`) and returns 0 to the module. A trap in the
+  module (a panic) is fatal: `onError` gets the panic and the stack once,
+  input and timers stop, and native components are destroyed (the player
+  closes). The `exports` an `onInstance` hook gets are wrapped the same
+  way: call the module only through them.
+- AVPlay is a singleton. The example takes it only when it is free
+  (getState NONE or IDLE): if the host page plays something itself, the
+  component reports `busy` and touches nothing.
 - Storage: the Worker has IndexedDB but not `localStorage`. The platform
   provides no NSH storage service (`EngineConfig::storage`). Patina's own
   persistence (the chunked SQLite VFS) runs through its imports.
@@ -129,7 +136,8 @@ NshTizenWorker.onInstance(function (exports, engine) {
 
 Keys arrive as NSH `KeyEvent`s on the view the app focused
 (`ElementRef::focus` on a `focusable` view) while it is attached, else on
-the newest attached view listening for keys, and bubble from there. The
+the topmost open modal's root, else on the root (the core starts them at
+the app's mount root), and bubble from there. The
 engine decides this from its own tree, so OK right after a move goes to the
 new focus; a release goes where its press went. `key` carries the UI Events
 name (`keys.rs`). `code` carries the browser's `KeyboardEvent.code`, which
@@ -151,8 +159,10 @@ recognize `ChannelUp`/`ChannelDown`, `ColorF0Red`…`ColorF3Blue`, `Info`,
 `Guide` or `MediaLast`. These are the UI Events names a browser platform
 delivers, so the decoder should accept them; the platform won't remap them.
 Patina's `input::window` focuses its root only on long-press platforms. On
-Tizen the root receives keys without a focus, because it is the newest key
-listener, so that works as is. OK on a focused pressable view presses it
+Tizen its window view hears keys without a focus, because a key reported at
+the root starts at the app's mount root, so that works as is. Back reaches
+the app only as the raw `GoBack` key: there is no NSH back handling
+(`onBackRequest`, `onRequestClose`) behind it. OK on a focused pressable view presses it
 and isn't also delivered as a raw key.
 
 ## Inputs

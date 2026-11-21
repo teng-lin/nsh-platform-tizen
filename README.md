@@ -115,8 +115,15 @@ nobody provides become no-ops, listed in `__nsh.engine.stubbed`.
 Failures are contained. An import that throws (the platform's or a host's)
 is caught, reported, and returns 0, never unwinding through the module. An
 import that calls back into the module during a pump is queued and runs
-when the outer call ends. A trap in the module (a Rust panic aborts) stops
-the engine: one error with its stack, and nothing calls into it again. A
+when the outer call ends, as do calls made while it delivers its output or
+while the app starts. A trap in the module (a Rust panic aborts) is one
+fatal transition: the panic's message and the trap's stack reach `onError`
+once, output not yet sent is dropped, the engine's timers stop, the page's
+key listeners go, native components are destroyed (the player closes), and
+nothing calls into the module again; the last frame stays on screen. Hooks
+get the exports wrapped the same way, so a host's own call that traps is
+fatal too, never a silent freeze. Errors are reported once each and then
+counted (`__nsh.errorCounts`), and metrics are saved at most every 2 s. A
 cached module that no longer links is evicted and compiled again once. The
 platform provides no NSH `storage`, `network` or `assets` service.
 Clipboard reads, `OpenUrl` and `PickScreenColor` are answered at once
@@ -136,23 +143,37 @@ resolves every family name, `serif` and `monospace` included, to one font.
 keys, `Info`, `Guide`, `ChannelList`, `MediaLast`, digits). The engine
 decides where a key goes, from the tree it just committed (the page's copy
 lags a message behind): the view the app focused (`ElementRef::focus` on a
-focusable view) while it is attached, else the newest attached view
-listening for keys, else the root. The page names only the input being
-edited. The core bubbles the key from there. OK on a focused view that takes
-presses presses it, without also arriving as a key. A key's release goes
-where its press went. The engine also reports the views' own `Focus` and
-`Blur`; an input taking the DOM focus takes it from the focused view, and a
-view taking the focus closes the TV keyboard.
+focusable view) while it is attached, else the topmost attached modal's
+root, else the root, where the core starts it at the view mounted there and
+bubbles it, as NSH's own backends report a key with nothing focused. The
+page names only the input being edited. OK on a focused view that takes
+presses presses it, without also arriving as a key. A key's repeats and
+release go where its press went (a release whose view left the tree goes
+where keys go now; one without a press is dropped). Keys go through the
+engine's own entry (`LocalEngine::key_event`), so `default_prevented`
+carries the app's `captureKeys` decision.
 
-Keys an input handled (Done, Cancel, Enter for a submit), Back while
-editing (it leaves the input), and a Back within `backDebounceMs` of the
-last are dropped on the way down and on the way up.
+The engine also reports the views' own `Focus` and `Blur`, each with the
+focused state (always: the core tracks it for every view). An input taking
+the DOM focus takes it from the focused view (the view's Blur first), a
+view taking the focus closes the TV keyboard, a Blur on the root blurs the
+input being edited, and a focused view that leaves the tree is blurred.
+
+On the page each physical key's press decides what it is: the app's, the
+TV keyboard's (while editing), or swallowed (keys an input handled: Done,
+Cancel, Enter for a submit; Back while editing, which leaves the input; a
+Back within `backDebounceMs` of the last). Its repeats and release follow
+that decision, so a release never reaches the app without its press.
 
 At start the page registers the table's keys one at a time with
 `tvinputdevice.registerKey`, and again when it becomes visible. Exit,
 Volume, Menu and Source stay the TV's. `code` is the browser's
 `KeyboardEvent.code`. No `default_prevented`: the page can't wait for the
 Worker, so it prevents the default of every key in the table.
+
+Not done: Back reaches the app only as the raw `GoBack` key; there is no
+NSH back handling (`onBackRequest`, `onRequestClose`, `popOnBack`) behind
+it yet.
 
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV
 keyboard. It handles value (dropped if the user typed since), placeholder
@@ -161,7 +182,9 @@ length, read only and auto focus. A masked input is always one line (a
 `<textarea>` cannot hide its text). Changing `multiline` while typing keeps
 the text, the focus and the selection. Focus and blur commands, change and submit
 events, and Focus/Blur all work. Done (65376) submits, and blurs unless the
-input keeps focus. Cancel (65385) and Back leave the input. While an input
+input keeps focus; held, it submits once. Cancel (65385) and Back leave
+the input. The input type is set before a multiline swap copies the value
+and selection. While an input
 is edited, the arrows, OK and digits belong to the keyboard.
 
 **Images.** `<img>` with `object-fit`, `object-position`, blur, a
@@ -169,9 +192,13 @@ placeholder, the `onLoad`/`onError`/`onLoadStart`/`onLoadEnd` events, and
 `asset:/x` served from the package's `assets/`. In-memory images (`data:`)
 come as bytes, placeholders included, and are shown through blob URLs of
 their type; a blob is released when no view shows it. `svg()` with a text
-color is drawn as a mask of that color. URIs are escaped in CSS, and an
-`<img>` loads only `http(s)`, `blob`, `data:image`, the package's files and
-relative URLs.
+color is drawn as a mask of that color. URIs are escaped in CSS. An
+`<img>` loads only `http(s)` URLs, the package's files by relative URL, and
+in-memory images by their key (any media type); `file:` and other schemes
+are refused, parsed as the browser parses them, and a refused source
+reports an image error. Each batch's in-memory images reach the page right
+before it, and a blob is released only when no view shows it at the end of
+a batch.
 
 **Diagnostics.**
 
@@ -180,19 +207,21 @@ relative URLs.
   and stubbed imports.
 - `localStorage['nsh.metrics']` keeps the last five launches.
 - `NshTizen.record()` keeps the next 50 batches (`NshTizen.recorded()`).
-- Benchmark builds only (`NSH_BENCH=1`, which adds `nsh-bench.js`):
-  `localStorage['nsh.autobench'] = '1'` runs the benchmark on the next
-  launch, with results in `nsh.bench`.
+- Benchmark builds only (`NSH_BENCH=1`, which adds `nsh-bench.js` with the
+  benchmark's hooks): `localStorage['nsh.autobench'] = '1'` runs the
+  benchmark on the next launch, with results in `nsh.bench`. The Worker
+  makes itself busy for the load scenario only in such builds.
 
 **CSP.** The example app declares one in `config.xml`, which moves Tizen
-from WARP to CSP mode: `default-src 'self'; script-src 'self'
-'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * blob: data:;
-font-src 'self' blob: data:; media-src *; connect-src *; object-src 'self';
-worker-src 'self' blob:`. The renderer needs inline styles (its `<style>`
-elements), `blob:` images and fonts, and `object-src` for AVPlay. Chromium
-69 has no `'wasm-unsafe-eval'`, so `'unsafe-eval'` allows the page-thread
-variant to compile. It runs on the TV with this policy, Worker and AVPlay
-included.
+from WARP to CSP mode: `default-src 'self'; script-src 'self'; style-src
+'self' 'unsafe-inline'; img-src * blob: data:; font-src 'self'; media-src
+*; connect-src *; object-src 'self'; worker-src 'self'`. The renderer needs
+inline styles (its `<style>` elements), `blob:` images and `object-src` for
+AVPlay. The Worker compiles WebAssembly outside the page's policy; the
+page-thread benchmark compiles on the page, which Chromium 69 allows only
+with `'unsafe-eval'` (it has no `'wasm-unsafe-eval'`), so `build.sh` adds
+it only to that build. `tools/page-test.mjs` serves the package's policy as
+the page's CSP header and fails on any violation.
 
 ## Build and test
 
@@ -237,6 +266,7 @@ same day.
 |---|---|---|---|
 | Worker, spike renderer (before) | 73–75 / 110–112 ms | 95–112 / 142–164 ms | 3–7 / 7–10 |
 | Worker, this renderer (after) | 61–72 / 98–133 ms | 101–107 / 131–166 ms | 1–4 / 2–7 |
+| Worker, after the review fixes (guarded imports, engine key routing) | 62–66 / 116–135 ms | 94–100 / 166–170 ms | 2 / 11 |
 | Page thread, this renderer | 70–72 / 123–126 ms | 93–97 / 114–117 ms | 13–17 / 20 |
 
 Per key on the page, with DevTools attached in both cases:
@@ -248,7 +278,11 @@ Per key on the page, with DevTools attached in both cases:
 | Operations | 81 | 67–93 (idle–load scenario; about 2 per key are left out by the sink's deduplication) |
 
 Engine per key (normal launches): 25–27 ms in the pump, of which about
-8 ms is text layout. Encoding and serializing take another 2–3 ms. The
+8 ms is text layout (21–24 ms after the review fixes: guarding every import
+costs nothing measurable). After those fixes the page's DOM apply was
+6.3–7.2 ms idle and 9.5–9.8 ms under load, and page frames over 50 ms
+under load rose from 2–7 to 11. That was one session of two runs, so the
+difference may be noise. Encoding and serializing take another 2–3 ms. The
 Worker's per-key cost stays in the engine; the renderer halved its share.
 
 ### Checked on the TV
@@ -312,8 +346,9 @@ file size, so a 12 MB module would need about 31 MB of the 88 MB quota.
 - `key_scrolled` isn't sent: scroll views move only by the app's commands.
   There is no directional focus navigation of its own; the app owns focus,
   as Patina's input layer does.
-- `default_prevented` / `captureKeys`: the page prevents every key in the
-  table; the app's capture rules aren't consulted.
+- `captureKeys` decides `default_prevented` in the engine, but the page
+  cannot wait for it: it prevents the default of every key in the table.
+- `backdrop-filter` (Chromium 69 has none): not drawn.
 - NSH services `storage`, `network`, `assets`, `clipboard`. UI-set font
   files (`Registry::asset_files`) need an `Assets` service, so only
   `Root::font` and host fonts register today.

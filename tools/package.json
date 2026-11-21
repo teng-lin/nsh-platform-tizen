@@ -1,0 +1,10 @@
+{
+  "name": "nsh-platform-tizen-tools",
+  "private": true,
+  "description": "Test tools only: a real ES2017 parse of the page runtime.",
+  "type": "module",
+  "devDependencies": {
+    "acorn": "8.14.0",
+    "acorn-walk": "8.3.4"
+  }
+}

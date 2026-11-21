@@ -18,11 +18,37 @@ const browser = process.argv[2] || 'chromium';
 let failures = 0;
 const check = (ok, what) => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`); if (!ok) failures++; };
 
-// ES2017 only: what Chromium 69 cannot parse must not be in the runtime.
-for (const f of ['renderer.js', 'engine.js', 'worker.js', 'page.js', 'avplay.js', 'bench-common.js']) {
-    const src = fs.readFileSync(path.join(root, 'runtime', f), 'utf8').replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '').replace(/'(?:\\.|[^'\\])*'/g, "''");
-    const bad = [/\?\./, /\?\?/, /\bglobalThis\b/, /\bWeakRef\b/, /\bclass\s+\w+\s*\{[^}]*#/, /\.at\(/, /\bimport\s*\(/, /\*\*=/].filter((r) => r.test(src));
-    check(bad.length === 0, `${f} has no syntax past ES2017 ${bad.join(' ')}`);
+// ES2017 only, by a real parse (acorn at ecmaVersion 2017) of what the
+// package ships: the bundles, the host's scripts and any inline script,
+// then a denylist of APIs Chromium 69 lacks and CSS it cannot read.
+const acorn = await import('acorn');
+const walk = await import('acorn-walk');
+const API = new Set(['globalThis', 'WeakRef', 'FinalizationRegistry', 'fromEntries', 'allSettled', 'matchAll', 'replaceAll',
+    'queueMicrotask', 'structuredClone', 'BigInt', 'hasOwn', 'findLast', 'findLastIndex', 'instantiateStreaming', 'compileStreaming']);
+const CSS = [/(^|[;{\s])gap\s*:/, /\b(min|max|clamp)\(/, /(^|[;{\s])inset\s*:/, /aspect-ratio/];
+function es2017(file, source) {
+    let ast;
+    try {
+        ast = acorn.parse(source, { ecmaVersion: 2017, sourceType: 'script', allowHashBang: false });
+    } catch (e) {
+        check(false, `${file} parses as ES2017: ${e.message}`);
+        return;
+    }
+    const used = new Set();
+    const css = new Set();
+    walk.full(ast, (node) => {
+        if (node.type === 'Identifier' && API.has(node.name)) used.add(node.name);
+        if (node.type === 'MemberExpression' && !node.computed && API.has(node.property.name)) used.add(node.property.name);
+        if (node.type === 'Literal' && typeof node.value === 'string') CSS.forEach((r) => { if (r.test(node.value)) css.add(String(r)); });
+    });
+    check(used.size === 0 && css.size === 0, `${file} is ES2017 and uses no newer API or CSS ${[...used, ...css].join(' ')}`);
+}
+for (const f of fs.readdirSync(stage).filter((f) => f.endsWith('.js'))) es2017(f, fs.readFileSync(path.join(stage, f), 'utf8'));
+for (const f of fs.readdirSync(stage).filter((f) => f.endsWith('.html'))) {
+    const html = fs.readFileSync(path.join(stage, f), 'utf8');
+    const inline = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)];
+    check(inline.length === 0, `${f} has no inline script (the CSP allows none)`);
+    inline.forEach((m, i) => es2017(`${f} inline ${i}`, m[1]));
 }
 
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm', '.png': 'image/png', '.ttf': 'font/ttf' };
@@ -103,6 +129,54 @@ for (const file of ['index.html', 'page-thread.html']) {
     await new Promise((r) => setTimeout(r, 500));
     const after = await p.evaluate('document.querySelectorAll("#app span").length');
     check(Math.abs(after - reused) < 20, `text spans are reused (${reused} → ${after})`);
+
+    // Down and OK back to back: OK plays the channel Down moved to.
+    const label = 'Array.prototype.map.call(document.querySelectorAll("#app span"), function (s) { return s.textContent; }).filter(function (t) { return t.indexOf(" · ") >= 0 || t.indexOf("OK plays") >= 0; }).join("|")';
+    await p.key(413);
+    await p.until(label + '.indexOf("OK plays") >= 0', 3000);
+    await p.call('Input.dispatchKeyEvent', { type: 'rawKeyDown', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 });
+    await p.call('Input.dispatchKeyEvent', { type: 'rawKeyDown', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 });
+    check(await p.until(label + '.indexOf("Channel 3") >= 0', 5000), 'Down then OK at once plays the channel moved to: ' + await p.evaluate(label));
+
+    // Keys the input consumed reach no app: Done submits without playing,
+    // Back leaves the input and is not a Back for the app.
+    await p.key(413);
+    await p.until(label + '.indexOf("OK plays") >= 0', 3000);
+    const sentKeys = 'NshTizen.metrics.keys.length';
+    await p.key(403);
+    await p.until('document.activeElement.tagName === "INPUT"', 3000);
+    await new Promise((r) => setTimeout(r, 300));
+    const k0 = await p.evaluate(sentKeys);
+    await p.key(13);
+    await new Promise((r) => setTimeout(r, 500));
+    check((await p.evaluate(label)).indexOf('OK plays') >= 0, 'Done in the input plays nothing: ' + await p.evaluate(label));
+    await p.key(403);
+    await p.until('document.activeElement.tagName === "INPUT"', 3000);
+    await new Promise((r) => setTimeout(r, 300));
+    const k1 = await p.evaluate(sentKeys);
+    await p.key(10009);
+    await new Promise((r) => setTimeout(r, 500));
+    check(await p.evaluate('document.activeElement.tagName !== "INPUT"'), 'Back left the input');
+    check(await p.evaluate(sentKeys) === k1, 'and reached no app (' + k1 + ' → ' + await p.evaluate(sentKeys) + ')');
+    check(k1 === k0 + 1, 'Done and its release sent nothing (Red did: ' + k0 + ' → ' + k1 + ')');
+    // A bounced Back is one Back.
+    await new Promise((r) => setTimeout(r, 700));
+    const k2 = await p.evaluate(sentKeys);
+    await p.key(10009);
+    await p.key(10009);
+    await new Promise((r) => setTimeout(r, 500));
+    check(await p.evaluate(sentKeys) === k2 + 1, 'two Backs within the debounce are one (' + k2 + ' → ' + await p.evaluate(sentKeys) + ')');
+
+    // The runtime's own cases (components, images, the AVPlay example).
+    const cases = await p.evaluate(fs.readFileSync(path.join(root, 'tools/runtime-cases.js'), 'utf8'));
+    for (const [ok, what] of cases || [[false, 'runtime cases ran']]) check(ok, what);
+
+    // A second start replaces the first: one app on the page.
+    await p.evaluate('NshTizen.start({ container: document.getElementById("app"), module: "app.wasm", version: window.NSH_MODULE_VERSION, thread: window.NSH_THREAD || "worker" }) && 1');
+    check(await p.until('window.__nsh.firstPaintAt > 0', 20000), 'a second start paints');
+    check(await p.evaluate('document.getElementById("app").children.length') === 1, 'and the first session\'s DOM is gone');
     p.ws.close();
 }
 

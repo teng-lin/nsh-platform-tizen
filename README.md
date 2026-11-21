@@ -22,7 +22,7 @@ measurements are at the end) and from
     components, inputs and images.
   - `page.js` holds `NshTizen.start`, key routing and the timing recorder.
   - `avplay.js` is an example AVPlay player component.
-  - `bench-common.js` is the shared benchmark.
+  - `bench.js` is the shared benchmark (`nsh-bench.js`, benchmark builds only).
   - `bundle.sh` concatenates them into `nsh-tizen.js` (page), `nsh-worker.js`
     (Worker) and `nsh-engine.js` (the page-thread benchmark).
 - `crates/guide-spike`: the test app. It shows a guide over video like

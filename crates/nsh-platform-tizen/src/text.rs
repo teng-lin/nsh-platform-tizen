@@ -302,14 +302,17 @@ impl<M: Measure> TizenTextEngine<M> {
 /// Samsung's names first: a 2020 set resolves every family to its one
 /// system font, and the Worker's canvas and the page then agree; newer sets
 /// may have more.
-const DEFAULT_FAMILY: &str = "SamsungOne,'Tizen Sans',sans-serif";
+const DEFAULT_FAMILY: &str = "SamsungOne, \"Tizen Sans\", sans-serif";
 
-/// The CSS family list of a text in `name` (the default's without one).
-fn family(name: Option<&str>) -> String {
-    name.map_or_else(
-        || DEFAULT_FAMILY.to_owned(),
-        |f| format!("'{f}',{DEFAULT_FAMILY}"),
-    )
+/// The CSS family list of a text whose `fontFamily` is `value` (a list:
+/// `Inter, sans-serif`), the default's after it: generic families stay bare
+/// (`monospace`), named ones are quoted and escaped
+/// (`nsh_core::css_font_families`).
+fn family(value: Option<&str>) -> String {
+    match value.map(nsh_core::css_font_families) {
+        Some(list) if !list.is_empty() => format!("{list}, {DEFAULT_FAMILY}"),
+        _ => DEFAULT_FAMILY.to_owned(),
+    }
 }
 
 /// A font as CSS declarations (the render layer drops a `font` shorthand
@@ -569,6 +572,15 @@ fn pieces(text: &str) -> Vec<String> {
     out
 }
 
+/// Adds its lifetime to the text stage of [`crate::stats`].
+struct Timed(nsh_core::time::Instant);
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        crate::stats::add(crate::stats::TEXT, self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nsh_core::geometry::size;
@@ -587,6 +599,23 @@ mod tests {
         let prepared = engine.prepare(&text(s));
         let laid = engine.layout(&prepared, size(Points(width), Points(100.0)));
         laid.downcast::<Layout>().unwrap().clone()
+    }
+
+    #[test]
+    fn family_lists_keep_generics_and_quote_names() {
+        assert_eq!(
+            family(Some("Inter, sans-serif")),
+            "\"Inter\", sans-serif, SamsungOne, \"Tizen Sans\", sans-serif"
+        );
+        assert_eq!(
+            family(Some("monospace")),
+            format!("monospace, {DEFAULT_FAMILY}")
+        );
+        assert_eq!(
+            family(Some("'A\"B'")),
+            format!("\"A\\\"B\", {DEFAULT_FAMILY}")
+        );
+        assert_eq!(family(None), DEFAULT_FAMILY);
     }
 
     #[test]
@@ -670,14 +699,5 @@ mod tests {
         let place = engine.attachments(&TextLayout(Arc::new(laid.clone())))[0].unwrap();
         assert!((place.x.0 - 4.0 * 7.7).abs() < 0.01);
         assert!((place.y.0 + 10.0 - baseline(&line.runs[0], 14.0)).abs() < 0.01);
-    }
-}
-
-/// Adds its lifetime to the text stage of [`crate::stats`].
-struct Timed(nsh_core::time::Instant);
-
-impl Drop for Timed {
-    fn drop(&mut self) {
-        crate::stats::add(crate::stats::TEXT, self.0);
     }
 }

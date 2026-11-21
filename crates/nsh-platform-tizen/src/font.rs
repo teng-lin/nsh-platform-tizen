@@ -1,100 +1,29 @@
 //! What the page needs to register a font file (`FontFace`): its family
-//! name, weight and style, read from the file's `name`, `OS/2` and `head`
-//! tables. A small reader of its own instead of a font crate: the module's
-//! size is the TV's launch time (about 3 s per MB to compile).
+//! name, as NSH's core reads it (`nsh_core::font_family`: the typographic
+//! family, WOFF and WOFF2 unwrapped), and its weight and style from
+//! `ttf-parser`, the reader nsh-core already links (no extra code in the
+//! module). A collection (TTC) gives its first font.
 
 /// A font file's face, as CSS names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Face {
     /// The family (the typographic family, else the family).
     pub family: String,
-    /// CSS `font-weight` (`OS/2` `usWeightClass`; 400 without the table).
+    /// CSS `font-weight` (`OS/2` `usWeightClass`).
     pub weight: u16,
     /// Italic or oblique.
     pub italic: bool,
 }
 
-fn u16_at(data: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]))
-}
-
-fn u32_at(data: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?))
-}
-
-/// The table `tag`'s bytes.
-fn table<'a>(data: &'a [u8], tag: &[u8; 4]) -> Option<&'a [u8]> {
-    let count = usize::from(u16_at(data, 4)?);
-    (0..count).find_map(|i| {
-        let record = 12 + i * 16;
-        if data.get(record..record + 4)? != tag {
-            return None;
-        }
-        let offset = u32_at(data, record + 8)? as usize;
-        let len = u32_at(data, record + 12)? as usize;
-        data.get(offset..offset.checked_add(len)?)
-    })
-}
-
-/// Name `id` of the `name` table: a Windows or Unicode record (UTF-16BE),
-/// else a Macintosh Roman one read as Latin-1.
-fn name(table: &[u8], id: u16) -> Option<String> {
-    let count = usize::from(u16_at(table, 2)?);
-    let strings = usize::from(u16_at(table, 4)?);
-    let mut mac = None;
-    for i in 0..count {
-        let record = 6 + i * 12;
-        let platform = u16_at(table, record)?;
-        if u16_at(table, record + 6)? != id {
-            continue;
-        }
-        let len = usize::from(u16_at(table, record + 8)?);
-        let offset = strings + usize::from(u16_at(table, record + 10)?);
-        let bytes = table.get(offset..offset + len)?;
-        match platform {
-            0 | 3 => {
-                let units: Vec<u16> = (0..bytes.len() / 2)
-                    .map(|i| u16::from_be_bytes([bytes[2 * i], bytes[2 * i + 1]]))
-                    .collect();
-                let text = String::from_utf16_lossy(&units);
-                if !text.is_empty() {
-                    return Some(text);
-                }
-            }
-            1 if mac.is_none() => mac = Some(bytes.iter().map(|&b| char::from(b)).collect()),
-            _ => {}
-        }
-    }
-    mac.filter(|s: &String| !s.is_empty())
-}
-
-/// The face of the TrueType / OpenType file `data` (a collection's first).
+/// The face of the TrueType / OpenType / WOFF / WOFF2 file `data`.
 pub fn parse(data: &[u8]) -> Result<Face, String> {
-    let data = match data.get(..4) {
-        Some(b"ttcf") => {
-            let first = u32_at(data, 12).ok_or("a truncated font collection")? as usize;
-            data.get(first..).ok_or("a truncated font collection")?
-        }
-        Some([0, 1, 0, 0] | b"OTTO" | b"true") => data,
-        _ => return Err("not a TrueType or OpenType font".to_owned()),
-    };
-    let names = table(data, b"name").ok_or("the font has no name table")?;
-    let family = name(names, 16)
-        .or_else(|| name(names, 1))
-        .ok_or("the font has no family name")?;
-    let os2 = table(data, b"OS/2");
-    let weight = os2
-        .and_then(|t| u16_at(t, 4))
-        .filter(|w| (1..=1000).contains(w))
-        .unwrap_or(400);
-    let italic = os2.and_then(|t| u16_at(t, 62)).is_some_and(|s| s & 1 != 0)
-        || table(data, b"head")
-            .and_then(|t| u16_at(t, 44))
-            .is_some_and(|s| s & 2 != 0);
+    let family = nsh_core::font_family(data)?;
+    let unwrapped = nsh_core::font_data(data)?;
+    let face = ttf_parser::Face::parse(&unwrapped, 0).map_err(|e| format!("not a font: {e}"))?;
     Ok(Face {
         family,
-        weight,
-        italic,
+        weight: face.weight().to_number(),
+        italic: face.is_italic() || face.is_oblique(),
     })
 }
 
@@ -102,43 +31,108 @@ pub fn parse(data: &[u8]) -> Result<Face, String> {
 pub(crate) mod tests {
     use super::*;
 
-    /// A font file with only the tables [`parse`] reads: `name` with the
-    /// family `family` (Windows, UTF-16BE) and a Macintosh record, `OS/2`
-    /// with `weight` and the italic bit.
-    pub(crate) fn font(family: &str, weight: u16, italic: bool) -> Vec<u8> {
+    fn be16(v: u16) -> [u8; 2] {
+        v.to_be_bytes()
+    }
+
+    /// The tables of a minimal font `ttf-parser` accepts: `head`, `hhea`,
+    /// `maxp`, `name` (family `family`, Windows UTF-16BE) and `OS/2`
+    /// (`weight`, the italic bit).
+    fn tables(family: &str, weight: u16, italic: bool) -> Vec<([u8; 4], Vec<u8>)> {
+        let mut head = vec![0u8; 54];
+        head[0..4].copy_from_slice(&[0, 1, 0, 0]);
+        head[12..16].copy_from_slice(&0x5F0F3CF5u32.to_be_bytes());
+        head[18..20].copy_from_slice(&be16(1000));
+        let mut hhea = vec![0u8; 36];
+        hhea[0..4].copy_from_slice(&[0, 1, 0, 0]);
+        hhea[34..36].copy_from_slice(&be16(1));
+        let mut maxp = vec![0, 0, 0x50, 0];
+        maxp.extend(be16(1));
         let utf16: Vec<u8> = family.encode_utf16().flat_map(u16::to_be_bytes).collect();
-        let mac = b"Mac Name".to_vec();
         let mut name = Vec::new();
-        name.extend(0u16.to_be_bytes()); // format
-        name.extend(2u16.to_be_bytes()); // count
-        name.extend((6u16 + 2 * 12).to_be_bytes()); // string offset
-        for (platform, encoding, len, offset) in [
-            (1u16, 0u16, mac.len() as u16, 0u16),
-            (3, 1, utf16.len() as u16, mac.len() as u16),
-        ] {
-            for v in [platform, encoding, 0, 1, len, offset] {
-                name.extend(v.to_be_bytes());
-            }
+        for v in [0u16, 1, 6 + 12] {
+            name.extend(be16(v));
         }
-        name.extend(&mac);
+        for v in [3u16, 1, 0x409, 1, utf16.len() as u16, 0] {
+            name.extend(be16(v));
+        }
         name.extend(&utf16);
-        let mut os2 = vec![0u8; 78];
-        os2[4..6].copy_from_slice(&weight.to_be_bytes());
-        os2[62..64].copy_from_slice(&u16::from(italic).to_be_bytes());
-        let tables: [(&[u8; 4], &[u8]); 2] = [(b"OS/2", &os2), (b"name", &name)];
+        // Version 4's 96 bytes.
+        let mut os2 = vec![0u8; 96];
+        os2[0..2].copy_from_slice(&be16(4));
+        os2[4..6].copy_from_slice(&be16(weight));
+        os2[62..64].copy_from_slice(&be16(u16::from(italic)));
+        vec![
+            (*b"OS/2", os2),
+            (*b"head", head),
+            (*b"hhea", hhea),
+            (*b"maxp", maxp),
+            (*b"name", name),
+        ]
+    }
+
+    /// An sfnt with `tables`, its table offsets counted from `base` (where
+    /// it starts in the file: a collection's fonts are not at 0).
+    fn sfnt(tables: &[([u8; 4], Vec<u8>)], base: usize) -> Vec<u8> {
         let mut out = vec![0, 1, 0, 0];
-        out.extend((tables.len() as u16).to_be_bytes());
+        out.extend(be16(tables.len() as u16));
         out.extend([0u8; 6]);
-        let mut offset = 12 + tables.len() * 16;
+        let mut offset = base + 12 + tables.len() * 16;
         let mut bodies = Vec::new();
         for (tag, body) in tables {
             out.extend(tag);
             out.extend([0u8; 4]);
             out.extend((offset as u32).to_be_bytes());
             out.extend((body.len() as u32).to_be_bytes());
-            offset += body.len();
-            bodies.extend_from_slice(body);
+            let padded = body.len().next_multiple_of(4);
+            offset += padded;
+            bodies.extend(body);
+            bodies.resize(bodies.len() + padded - body.len(), 0);
         }
+        out.extend(bodies);
+        out
+    }
+
+    pub(crate) fn font(family: &str, weight: u16, italic: bool) -> Vec<u8> {
+        sfnt(&tables(family, weight, italic), 0)
+    }
+
+    /// A collection of one font: offsets are counted from the file's start.
+    fn collection(family: &str) -> Vec<u8> {
+        let mut out = b"ttcf".to_vec();
+        out.extend([0, 1, 0, 0]);
+        out.extend(1u32.to_be_bytes());
+        out.extend(16u32.to_be_bytes());
+        out.extend(sfnt(&tables(family, 300, false), 16));
+        out
+    }
+
+    /// A WOFF 1.0 file of the same tables, stored uncompressed.
+    fn woff(family: &str) -> Vec<u8> {
+        let tables = tables(family, 500, true);
+        let font = font(family, 500, true);
+        let mut dir = Vec::new();
+        let mut bodies = Vec::new();
+        let mut offset = 44 + tables.len() * 20;
+        for (tag, body) in &tables {
+            dir.extend(tag);
+            dir.extend((offset as u32).to_be_bytes());
+            dir.extend((body.len() as u32).to_be_bytes());
+            dir.extend((body.len() as u32).to_be_bytes());
+            dir.extend(0u32.to_be_bytes());
+            let padded = body.len().next_multiple_of(4);
+            offset += padded;
+            bodies.extend(body);
+            bodies.resize(bodies.len() + padded - body.len(), 0);
+        }
+        let mut out = b"wOFF".to_vec();
+        out.extend([0, 1, 0, 0]);
+        out.extend((offset as u32).to_be_bytes());
+        out.extend(be16(tables.len() as u16));
+        out.extend(be16(0));
+        out.extend((font.len() as u32).to_be_bytes());
+        out.extend([0u8; 24]);
+        out.extend(dir);
         out.extend(bodies);
         out
     }
@@ -154,7 +148,21 @@ pub(crate) mod tests {
                 italic: true
             }
         );
-        assert_eq!(parse(&font("Guide Sans", 0, false)).unwrap().weight, 400);
+    }
+
+    #[test]
+    fn reads_a_collections_first_font() {
+        let face = parse(&collection("Guide Mono")).unwrap();
+        assert_eq!((face.family.as_str(), face.weight), ("Guide Mono", 300));
+    }
+
+    #[test]
+    fn reads_woff() {
+        let face = parse(&woff("Guide Serif")).unwrap();
+        assert_eq!(
+            (face.family.as_str(), face.weight, face.italic),
+            ("Guide Serif", 500, true)
+        );
     }
 
     #[test]

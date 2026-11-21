@@ -1182,6 +1182,7 @@ dependencies = [
  "nsh-core",
  "nsh-engine",
  "serde_json",
+ "ttf-parser",
 ]
 
 [[package]]

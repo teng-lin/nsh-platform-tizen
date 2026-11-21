@@ -12,7 +12,12 @@
 //! `nsh_tz_stat`. After each, what the engine made arrives through the
 //! imports: `image_bytes` per in-memory image, `submit` per commit,
 //! `request_frame`, `schedule` (the next pump, in ms; -1 for none) and
-//! `report_error`.
+//! `report_error`; `wake` when work arrives outside a pump (pump soon).
+//!
+//! Calls into the module while it runs (a host import calling an export)
+//! are queued and run when the outer call ends. A JS exception thrown
+//! inside an import would unwind through Rust frames and leave the
+//! runtime borrowed: the runtime (`engine.js`) catches every import's.
 //!
 //! Imports, module `nsh_tz`: those, `measure_text`, `register_font`,
 //! `remote_keys` (the key table, once at start), `log` and `host`. NSH's
@@ -51,7 +56,16 @@ unsafe extern "C" {
         italic: u32,
     );
     #[link_name = "image_bytes"]
-    fn js_image_bytes(uri: *const u8, uri_len: usize, data: *const u8, data_len: usize);
+    fn js_image_bytes(
+        uri: *const u8,
+        uri_len: usize,
+        mime: *const u8,
+        mime_len: usize,
+        data: *const u8,
+        data_len: usize,
+    );
+    #[link_name = "wake"]
+    fn js_wake();
     #[link_name = "remote_keys"]
     fn js_remote_keys(json: *const u8, len: usize);
 }
@@ -166,17 +180,32 @@ fn report_error(message: &str) {
     unsafe { js_report_error(message.as_ptr(), message.len()) };
 }
 
+/// The media type an in-memory image's key names (`data:image/svg+xml;
+/// nsh-key=…`), for the page's blob: an SVG without one does not load.
+fn mime_of(uri: &str) -> &str {
+    uri.strip_prefix("data:")
+        .and_then(|rest| rest.split([';', ',']).next())
+        .unwrap_or("")
+}
+
 /// Hands what a pump made to JS.
 fn deliver(pumped: Pumped) {
     for (uri, data) in &pumped.images {
         let bytes = data.bytes();
+        let mime = mime_of(uri);
         // SAFETY: live slices JS copies during the call.
-        unsafe { js_image_bytes(uri.as_ptr(), uri.len(), bytes.as_ptr(), bytes.len()) };
+        unsafe {
+            js_image_bytes(
+                uri.as_ptr(),
+                uri.len(),
+                mime.as_ptr(),
+                mime.len(),
+                bytes.as_ptr(),
+                bytes.len(),
+            )
+        };
     }
-    for batch in pumped.batches {
-        let started = nsh_core::time::now();
-        let json = batch.to_string();
-        crate::stats::add(crate::stats::SERIALIZE, started);
+    for json in pumped.batches {
         // SAFETY: a live string JS only reads during the call.
         unsafe { js_submit(json.as_ptr(), json.len()) };
     }
@@ -191,10 +220,31 @@ fn deliver(pumped: Pumped) {
     unsafe { js_schedule(pumped.next.unwrap_or(-1.0)) };
 }
 
-fn with_runtime(f: impl FnOnce(&mut Runtime<HostMeasure>) -> Pumped) {
-    let pumped = RUNTIME.with(|r| r.borrow_mut().as_mut().map(f));
-    if let Some(pumped) = pumped {
-        deliver(pumped);
+type Call = Box<dyn FnOnce(&mut Runtime<HostMeasure>) -> Pumped>;
+
+thread_local! {
+    /// Calls that arrived while the runtime was busy: a host import that
+    /// calls back into the module (`engine.pump()`, an event) during a
+    /// pump. They run, in order, when the outer call ends.
+    static QUEUED: RefCell<std::collections::VecDeque<Call>> = RefCell::default();
+}
+
+/// Runs `f` on the runtime and hands its result to JS, then what was
+/// queued meanwhile. Re-entered (the runtime is borrowed), it queues `f`
+/// instead of aborting the module on a second borrow.
+fn with_runtime(f: impl FnOnce(&mut Runtime<HostMeasure>) -> Pumped + 'static) {
+    let busy = RUNTIME.with(|r| r.try_borrow_mut().is_err());
+    if busy {
+        QUEUED.with(|q| q.borrow_mut().push_back(Box::new(f)));
+        return;
+    }
+    let mut next: Option<Call> = Some(Box::new(f));
+    while let Some(call) = next.take() {
+        let pumped = RUNTIME.with(|r| r.borrow_mut().as_mut().map(call));
+        if let Some(pumped) = pumped {
+            deliver(pumped);
+        }
+        next = QUEUED.with(|q| q.borrow_mut().pop_front());
     }
 }
 
@@ -249,9 +299,11 @@ pub extern "C" fn nsh_tz_start(
     let keys = crate::keys::keys_json();
     // SAFETY: a live string JS only reads during the call.
     unsafe { js_remote_keys(keys.as_ptr(), keys.len()) };
-    let Some(runtime) = Runtime::start(root, sets, device, HostMeasure) else {
+    let Some(mut runtime) = Runtime::start(root, sets, device, HostMeasure) else {
         return 0;
     };
+    // SAFETY: a host function without arguments.
+    runtime.set_wake(std::sync::Arc::new(|| unsafe { js_wake() }));
     RUNTIME.with(|r| *r.borrow_mut() = Some(runtime));
     with_runtime(Runtime::pump);
     1
@@ -280,7 +332,7 @@ pub unsafe extern "C" fn nsh_tz_event(id: u32, name: *const u8, len: usize) {
     // SAFETY: guaranteed by the caller.
     let bytes = unsafe { std::slice::from_raw_parts(name, len) };
     let name = String::from_utf8_lossy(bytes).into_owned();
-    with_runtime(|r| r.event(id, &name));
+    with_runtime(move |r| r.event(id, &name));
 }
 
 /// Input `id` reported event `name` with its whole text, after the user's
@@ -307,11 +359,12 @@ pub unsafe extern "C" fn nsh_tz_text(
     };
     let name = String::from_utf8_lossy(name).into_owned();
     let text = String::from_utf8_lossy(text).into_owned();
-    with_runtime(|r| r.text(id, &name, text, count));
+    with_runtime(move |r| r.text(id, &name, text, count));
 }
 
-/// A remote key on view `id` (the focused view, or the one the page sends
-/// keys to): Samsung's `key_code` and the browser's `KeyboardEvent.key` /
+/// A remote key on view `id` (0: the platform's choice, the focused view or
+/// the newest key listener; the page names only the input it edits):
+/// Samsung's `key_code` and the browser's `KeyboardEvent.key` /
 /// `.code` (UTF-8 strings from [`nsh_tz_alloc`]); the app gets the DOM's
 /// name for it ([`crate::keys`]).
 ///
@@ -332,7 +385,7 @@ pub unsafe extern "C" fn nsh_tz_key(
 ) {
     // SAFETY: guaranteed by the caller.
     let (key, code) = unsafe { (string(key, key_len), string(code, code_len)) };
-    with_runtime(|r| r.remote_key(id, key_code, &key, &code, down != 0, repeat != 0));
+    with_runtime(move |r| r.remote_key(id, key_code, &key, &code, down != 0, repeat != 0));
 }
 
 /// # Safety
@@ -361,13 +414,13 @@ pub unsafe extern "C" fn nsh_tz_native(
     // SAFETY: guaranteed by the caller.
     let (name, data) = unsafe { (string(name, name_len), string(data, data_len)) };
     let data = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
-    with_runtime(|r| r.native_event(id, &name, data));
+    with_runtime(move |r| r.native_event(id, &name, data));
 }
 
 /// View `id` took (`focused` 1) or lost the focus.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsh_tz_focus(id: u32, focused: u32) {
-    with_runtime(|r| r.focus(id, focused != 0));
+    with_runtime(move |r| r.focus(id, focused != 0));
 }
 
 /// Image `id` loaded (`ok` 1, `width` × `height` pixels) or failed with
@@ -390,7 +443,7 @@ pub unsafe extern "C" fn nsh_tz_image(
         0 => Err(unsafe { string(message, len) }),
         _ => Ok((width as i32, height as i32)),
     };
-    with_runtime(|r| r.image(id, result));
+    with_runtime(move |r| r.image(id, result));
 }
 
 /// The fonts the app registered have loaded on the page and in the
@@ -410,13 +463,13 @@ pub extern "C" fn nsh_tz_stat(stage: u32) -> f64 {
 /// View `id` shows interaction `states` (`nsh_core::tailwind::state`).
 #[unsafe(no_mangle)]
 pub extern "C" fn nsh_tz_states(id: u32, states: u32) {
-    with_runtime(|r| r.states(id, states as u16));
+    with_runtime(move |r| r.states(id, states as u16));
 }
 
 /// Scroll view `id` scrolled to `(x, y)`.
 #[unsafe(no_mangle)]
 pub extern "C" fn nsh_tz_scroll(id: u32, x: f32, y: f32) {
-    with_runtime(|r| r.scroll(id, x, y));
+    with_runtime(move |r| r.scroll(id, x, y));
 }
 
 /// The page's size or appearance changed.
@@ -429,5 +482,5 @@ pub extern "C" fn nsh_tz_device(width: f32, height: f32, pixel_ratio: f32, dark:
         dark: dark != 0,
         os: os_of(os),
     };
-    with_runtime(|r| r.set_device(device));
+    with_runtime(move |r| r.set_device(device));
 }

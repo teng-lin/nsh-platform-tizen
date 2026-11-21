@@ -25,10 +25,14 @@
 //! | `ic` | id, x, y, width, height | where an input's text goes |
 //! | `fo` | id, focus | focus (`true`) or blur an input or a focusable view |
 //! | `n` | id, name | create the registered native component `name` in a `native` view |
-//! | `np` | id, props | its changed props: `{ name: value }`, `null` removes one |
+//! | `np` | id, props, removed | its changed props `{ name: value }` (a value may be `null`) and the names of those removed |
 //! | `nc` | id, name, args | a command to it (`ElementRef::command`) |
-//! | `cv` | id, ops | what a canvas draws ([`crate::canvas`]) |
 //! | `x` | id | leave the app (`Command::ExitApp`) |
+//! | `ir` | uri | no view shows the in-memory image `uri` any more: release its blob |
+//!
+//! Canvases are not drawn yet: [`crate::canvas`] encodes a drawing, but
+//! the page has no interpreter for it, so `Canvas` items count as not
+//! shown.
 //!
 //! Items this platform does not show yet are left out ([`shown`] says
 //! which; the README's "Not done").
@@ -95,7 +99,6 @@ pub fn shown(item: &MountItem) -> bool {
         | M::InputContent { .. }
         | M::Component { .. }
         | M::ComponentProps { .. }
-        | M::Canvas { .. }
         | M::Animation(_)
         | M::AnimationBindings { .. }
         | M::Gestures { .. }
@@ -202,13 +205,6 @@ pub fn item(item: &MountItem) -> Option<Value> {
                 options.current_color.map(color)
             ])
         }
-        MountItem::Canvas { id, drawing } => {
-            json!([
-                "cv",
-                id,
-                serde_json::from_str::<Value>(&crate::canvas::encode(drawing)).ok()?
-            ])
-        }
         MountItem::Input { id, config } => json!(["in", id, input(config)]),
         MountItem::InputValue { id, text, count } => json!(["iv", id, text, count]),
         MountItem::InputContent { id, content } => json!([
@@ -221,11 +217,17 @@ pub fn item(item: &MountItem) -> Option<Value> {
         ]),
         MountItem::Component { id, name } => json!(["n", id, &**name]),
         MountItem::ComponentProps { id, props } => {
+            // A prop set to JSON `null` and a prop removed are told apart.
             let changed: serde_json::Map<String, Value> = props
                 .iter()
-                .map(|(name, value)| (name.to_string(), value.clone().unwrap_or(Value::Null)))
+                .filter_map(|(name, value)| Some((name.to_string(), value.clone()?)))
                 .collect();
-            json!(["np", id, changed])
+            let removed: Vec<&str> = props
+                .iter()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| &**name)
+                .collect();
+            json!(["np", id, changed, removed])
         }
         MountItem::Command { id, command } => match command {
             nsh_core::Command::Focus => json!(["fo", id, true]),
@@ -261,7 +263,8 @@ fn object_position(p: &nsh_core::ObjectPosition) -> String {
 /// An input's configuration as the page's `<input>` / `<textarea>` takes
 /// it: `css` (font, color, caret, alignment), `ph` / `phc` (placeholder and
 /// its color), `type` (`text`, `password`, `number`, `email`, `tel`,
-/// `url`), `ml` (multiline), `max` (-1: none), `off` (not editable),
+/// `url`), `ml` (multiline; never for a masked input, which a `<textarea>`
+/// would show in plain text), `max` (-1: none), `off` (not editable),
 /// `submit` (`blur`, `keep` or `newline`: what the keyboard's Done does),
 /// `auto` (focus once on screen).
 fn input(config: &nsh_core::InputConfig) -> Value {
@@ -305,7 +308,8 @@ fn input(config: &nsh_core::InputConfig) -> Value {
         "ph": config.placeholder,
         "phc": config.placeholder_color.map(color),
         "type": kind,
-        "ml": config.multiline,
+        // A masked input is one line: a <textarea> cannot hide its text.
+        "ml": config.multiline && !config.secure,
         "max": config.max_length.map_or(-1, i64::from),
         "off": !config.editable,
         "submit": submit,

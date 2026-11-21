@@ -128,17 +128,18 @@ pub fn key_name(code: u32, dom_key: &str) -> &str {
 }
 
 /// The table as the page reads it: `[[code, key, tizen name or null,
-/// registered at start], ...]`.
+/// registered at start, the input's own while edited], ...]`.
 pub fn keys_json() -> String {
     let rows: Vec<serde_json::Value> = KEYS
         .iter()
-        .map(|k| serde_json::json!([k.code, k.key, k.tizen, k.register]))
+        .map(|k| serde_json::json!([k.code, k.key, k.tizen, k.register, editing_key(k.code)]))
         .collect();
     serde_json::Value::Array(rows).to_string()
 }
 
 /// Whether a remote key is an input's own while it is edited: the TV's
-/// keyboard takes the arrows, Enter and digits.
+/// keyboard takes the arrows, OK, digits and minus (the page adds the
+/// keyboard's own Done and Cancel, 65376 and 65385, which reach no app).
 pub fn editing_key(code: u32) -> bool {
     matches!(code, 13 | 37..=40 | 48..=57 | 189)
 }
@@ -192,7 +193,17 @@ mod tests {
             .iter()
             .find(|r| r[0] == 10009)
             .unwrap();
-        assert_eq!(back, &serde_json::json!([10009, "GoBack", null, false]));
+        assert_eq!(
+            back,
+            &serde_json::json!([10009, "GoBack", null, false, false])
+        );
+        let ok = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r[0] == 13)
+            .unwrap();
+        assert_eq!(ok[4], true, "OK is the keyboard's while editing");
         assert!(
             rows.as_array()
                 .unwrap()

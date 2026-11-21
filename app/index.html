@@ -4,16 +4,14 @@
 <meta charset="utf-8">
 <title>NSH guide</title>
 <script src="$WEBAPIS/webapis/webapis.js"></script>
-<style>
-/* Transparent down to the body: AVPlay's video plane is under the page. */
-html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent; }
-#app { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
-</style>
+<link rel="stylesheet" href="page.css">
 </head>
 <body>
-<object id="player" type="application/avplayer" style="position:absolute;left:0;top:0;width:1920px;height:1080px"></object>
+<object id="player" type="application/avplayer"></object>
 <div id="app"></div>
 <script src="nsh-tizen.js"></script>
+<!--bench-->
+<script src="app-config.js"></script>
 <script src="host.js"></script>
 </body>
 </html>

@@ -5,7 +5,14 @@
     <name>NSH Spike</name>
     <icon src="icon.png"/>
     <content src="index.html"/>
+    <!-- Streams, logos and guide data come from anywhere. -->
     <access origin="*" subdomains="true"/>
+    <!-- Declaring a policy moves Tizen from WARP to CSP mode. The renderer
+         needs inline styles (its own <style> elements), blob: images and
+         fonts (in-memory images, app fonts), object-src for AVPlay's
+         <object>, and wasm compilation ('unsafe-eval' on Chromium 69, which
+         has no 'wasm-unsafe-eval'). -->
+    <tizen:content-security-policy>default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * blob: data:; font-src 'self' blob: data:; media-src *; connect-src *; object-src 'self'; worker-src 'self' blob:</tizen:content-security-policy>
     <tizen:privilege name="http://tizen.org/privilege/internet"/>
     <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
     <tizen:setting screen-orientation="landscape" context-menu="disable" background-support="disable" hwkey-event="enable"/>

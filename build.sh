@@ -5,6 +5,7 @@
 # Tizen Studio's CLI.
 #
 #   NSH_PAGE=page-thread.html  start the page-thread benchmark variant
+#   NSH_BENCH=1                include the shared benchmark (nsh-bench.js)
 #   NSH_OPT=s|z|3              opt-level (default 3)
 #   NSH_FEATURES=...           guide-spike features (ballast)
 #   NSH_FONT=path.ttf          ship a font and register it from the host page ("Host Font")
@@ -25,15 +26,23 @@ RUSTFLAGS="-C target-cpu=mvp -C target-feature=+sign-ext,+mutable-globals" \
 stage="$root/target/stage"
 rm -rf "$stage" && mkdir -p "$stage/assets"
 "$root/runtime/bundle.sh" "$stage"
-cp "$root"/app/{index.html,page-thread.html,host.js} "$stage/"
+cp "$root"/app/{index.html,page-thread.html,page.css,page-thread.js,host.js} "$stage/"
 sed "s|<content src=\"index.html\"/>|<content src=\"${NSH_PAGE:-index.html}\"/>|" "$root/app/config.xml" > "$stage/config.xml"
 cp "$root/../patina-iptv/art/icon/play-512.png" "$stage/icon.png"
 cp "$root/../patina-iptv/art/icon/play-512.png" "$stage/assets/logo.png"
+cp "$root/target/tizen-wasm/wasm32-unknown-unknown/release/guide_spike.wasm" "$stage/app.wasm"
+# The module's SHA-256 keys the compiled-module cache: a rebuilt module
+# never runs the old compiled code.
+version="$(sha256sum "$stage/app.wasm" | cut -c1-64)"
+fonts="[]"
 if [[ -n "${NSH_FONT:-}" ]]; then
     mkdir -p "$stage/fonts" && cp "$NSH_FONT" "$stage/fonts/host.ttf"
-    sed -i 's|<script src="host.js">|<script>window.NSH_FONTS = [{ family: "Host Font", url: "fonts/host.ttf" }];</script>\n<script src="host.js">|' "$stage/index.html" "$stage/page-thread.html"
+    fonts='[{ family: "Host Font", url: "fonts/host.ttf" }]'
 fi
-cp "$root/target/tizen-wasm/wasm32-unknown-unknown/release/guide_spike.wasm" "$stage/app.wasm"
+printf "/* Written by build.sh. */\nwindow.NSH_MODULE_VERSION = '%s';\nwindow.NSH_FONTS = %s;\n" "$version" "$fonts" > "$stage/app-config.js"
+if [[ -n "${NSH_BENCH:-}" ]]; then
+    sed -i 's|<!--bench-->|<script src="nsh-bench.js"></script>|' "$stage/index.html" "$stage/page-thread.html"
+fi
 ls -la "$stage/app.wasm"
 tizen="$(command -v tizen || echo "$HOME/tizen-studio/tools/ide/bin/tizen")"
 "$tizen" package -t wgt -s "${TIZEN_SIGNING_PROFILE:?set TIZEN_SIGNING_PROFILE}" -- "$stage" >/dev/null

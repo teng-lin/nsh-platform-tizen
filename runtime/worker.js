@@ -31,7 +31,12 @@ function nshHostFonts(engine, fonts) {
             x.responseType = 'arraybuffer';
             x.onload = function () {
                 if (!x.response) { ok(); return; }
-                engine.registerFont(f.family, x.response, f.weight || 400, f.style === 'italic', false).then(ok, ok);
+                try {
+                    engine.registerFont(f.family, x.response, f.weight || 400, f.style === 'italic', false).then(ok, ok);
+                } catch (e) {
+                    engine.M.fontErrors = (engine.M.fontErrors || []).concat([f.family + ': ' + e]);
+                    ok();
+                }
             };
             x.onerror = function () { ok(); };
             x.send();
@@ -39,32 +44,49 @@ function nshHostFonts(engine, fonts) {
     }));
 }
 
+/* The start failed: messages are dropped from now on, not queued. */
+var nshFailed = false;
+
+function nshFail(engine, err) {
+    nshFailed = true;
+    nshQueue = [];
+    var text = String(err && err.stack || err);
+    if (engine) { engine.M.fatal = text; nshPost({ t: 'metrics', m: engine.M }); }
+    nshPost({ t: 'error', dead: true, text: 'could not start: ' + text });
+}
+
 onmessage = function (e) {
     var m = e.data;
     if (m.t === 'init') {
-        var measure = null, M0 = {};
-        try { measure = new OffscreenCanvas(1, 1).getContext('2d'); } catch (err) { M0.offscreen = 'error ' + err; }
-        (m.scripts || []).forEach(function (s) { importScripts(s); });
-        var engine = new NshEngine({ out: nshPost, measure: measure });
-        for (var k in M0) engine.M[k] = M0[k];
+        var measure = null, engine = null;
+        try {
+            try { measure = new OffscreenCanvas(1, 1).getContext('2d'); } catch (err) { measure = null; }
+            /* Host scripts first: their imports are needed to link. */
+            (m.scripts || []).forEach(function (s) { importScripts(s); });
+            engine = new NshEngine({ out: nshPost, measure: measure });
+        } catch (err) {
+            nshFail(engine, err);
+            return;
+        }
         var f0 = performance.now();
         nshHostFonts(engine, m.fonts).then(function () {
             engine.M.hostFontsMs = Math.round(performance.now() - f0);
-            return engine.start(m.module, m.device);
+            return engine.start(m.module, m.device, m.version);
         }).then(function () {
             nshEngine = engine;
             nshQueue.forEach(function (q) { engine.handle(q); });
             nshQueue = [];
             nshPost({ t: 'metrics', m: engine.M });
-        }).catch(function (err) {
-            engine.M.fatal = String(err && err.stack || err);
-            nshPost({ t: 'metrics', m: engine.M });
-            nshPost({ t: 'error', text: 'could not start: ' + err });
-        });
+        }).catch(function (err) { nshFail(engine, err); });
         return;
     }
+    if (nshFailed) return;
     if (m.t === 'load') { nshSetLoad(m.on); return; }
     if (m.t === 'metrics') { if (nshEngine) nshPost({ t: 'metrics', m: nshEngine.M }); return; }
-    if (!nshEngine) { if (m.t !== 'frame') nshQueue.push(m); return; }
+    if (!nshEngine) {
+        /* Input before the app started; bounded (a start takes seconds). */
+        if (m.t !== 'frame' && nshQueue.length < 256) nshQueue.push(m);
+        return;
+    }
     nshEngine.handle(m);
 };

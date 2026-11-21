@@ -9,6 +9,7 @@
  *   source  {url, token} or null: a new url or token reopens; null stops
  *   paused  bool
  *   seek    {token, id, ms}: seeks once per id, for the current token
+ *           (one asked before the stream is ready waits for it)
  * Events:
  *   state       {state}: idle | buffering | ready | ended
  *   size        {width, height}: the video's, once known
@@ -19,50 +20,53 @@
  *   error       {code}: AVPlay's error name; the player is closed after it
  * Not supported by AVPlay here (ignored): headers, volume, muted, tracks.
  *
- * AVPlay is one player per app: a second instance reports error `busy`.
+ * AVPlay is one player per app: a second instance reports error `busy`
+ * while another plays. Each opening is a generation (`token`): it is
+ * invalidated before anything is torn down, so a late callback of an
+ * older one does nothing. While the page is hidden the stream is closed
+ * and its position kept; it reopens there when the page shows again.
  * Everything a view draws over the video must be transparent, up to the
- * page's body. Plain ES2017 (Chromium 69).
+ * page's body.
+ *
+ * `NshTizen.avplay.api` is the player it drives (webapis.avplay); tests
+ * replace it. Plain ES2017 (Chromium 69).
  */
 'use strict';
 
 NshTizen.avplay = (function () {
     var owner = null;
 
-    function av() { return typeof webapis !== 'undefined' && webapis.avplay ? webapis.avplay : null; }
-
-    /* The page's one <object type="application/avplayer">, first in body. */
-    function surface() {
-        var o = document.querySelector('object[type="application/avplayer"]');
-        if (!o) {
-            o = document.createElement('object');
-            o.setAttribute('type', 'application/avplayer');
-            o.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px;';
-            document.body.insertBefore(o, document.body.firstChild);
-        }
-        return o;
-    }
-
-    return function (ctx) {
+    function factory(ctx) {
         var props = {};
         var rect = null;
-        var token = 0;        /* a generation: stale callbacks are dropped */
+        var token = 0;        /* the current generation */
         var opened = null;    /* the source this instance opened */
+        var prepared = false;
         var sizeSent = false, rendered = false, lastPosition = -1e9;
-        var lastSeek = null;
-        var hiddenSource = null;
+        var lastSeek = null, pendingSeek = null;
+        var hidden = null;    /* {source, ms}: closed while the page is hidden */
 
+        function av() { return factory.api(); }
         function emit(name, data) { ctx.emit(name, data); }
 
-        function close() {
-            /* Never touch a player this instance did not open (and not
-             * webapis before it is needed: the first `webapis.avplay` costs
-             * about 0.7 s of the page's thread on a 2020 set). */
-            if (owner !== ctx) return;
+        /* The one teardown: invalidate callbacks, close, release. */
+        function teardown() {
+            token++;
+            prepared = false;
+            if (owner !== ctx) { opened = null; return; }
             var p = av();
-            if (!p) return;
-            try { p.stop(); } catch (e) { /* idle */ }
-            try { p.close(); } catch (e) { /* closed */ }
+            if (p) {
+                try { p.stop(); } catch (e) { /* idle */ }
+                try { p.close(); } catch (e) { /* closed */ }
+            }
             opened = null;
+            owner = null;
+        }
+
+        function fail(code) {
+            emit('error', { code: String(code) });
+            teardown();
+            emit('state', { state: 'idle' });
         }
 
         function applyRect() {
@@ -75,56 +79,58 @@ NshTizen.avplay = (function () {
             try { p.setDisplayRect(Math.round(r.x * k), Math.round(r.y * k), Math.max(1, Math.round(r.width * k)), Math.max(1, Math.round(r.height * k))); } catch (e) { /* not open */ }
         }
 
-        function open(source) {
+        /* Opens `source`, from `startMs` when reopening after the page was
+         * hidden. */
+        function open(source, startMs) {
+            /* Never touch webapis before it is needed: the first
+             * `webapis.avplay` costs about 0.7 s of the page's thread on a
+             * 2020 set. */
             var p = av();
             if (!p) { emit('error', { code: 'unavailable' }); return; }
             if (owner && owner !== ctx) { emit('error', { code: 'busy' }); return; }
+            teardown();
+            var my = token;
             owner = ctx;
-            surface();
-            close();
-            var my = ++token;
+            opened = source;
             sizeSent = false; rendered = false; lastPosition = -1e9;
+            lastSeek = null; pendingSeek = props.seek || null;
+            var live = function () { return my === token && owner === ctx; };
             try {
                 p.open(source.url);
-                opened = source;
                 try { p.setTimeoutForBuffering(15); } catch (e) { /* older firmware */ }
                 applyRect();
                 p.setListener({
-                    onbufferingstart: function () { if (my === token) emit('state', { state: 'buffering' }); },
-                    onbufferingcomplete: function () { if (my === token) emit('state', { state: 'ready' }); },
+                    onbufferingstart: function () { if (live()) emit('state', { state: 'buffering' }); },
+                    onbufferingcomplete: function () { if (live()) emit('state', { state: 'ready' }); },
                     oncurrentplaytime: function (ms) {
-                        if (my !== token) return;
+                        if (!live()) return;
                         if (!rendered) { rendered = true; emit('firstRender', { token: source.token || 0 }); }
                         if (!sizeSent) sendSize();
                         if (ms - lastPosition >= 1000 || ms < lastPosition) { lastPosition = ms; emit('position', { ms: ms }); }
                     },
-                    onstreamcompleted: function () { if (my === token) emit('state', { state: 'ended' }); },
-                    onerror: function (type) {
-                        if (my !== token) return;
-                        emit('error', { code: String(type) });
-                        /* A player left in error blocks AVPlay until a reboot. */
-                        close();
-                        emit('state', { state: 'idle' });
-                    },
+                    onstreamcompleted: function () { if (live()) emit('state', { state: 'ended' }); },
+                    onerror: function (type) { if (live()) fail(type); },
                     onevent: function () {}
                 });
                 emit('state', { state: 'buffering' });
                 p.prepareAsync(function () {
-                    if (my !== token) return;
-                    applyRect();
-                    if (!props.paused) p.play();
-                    emit('state', { state: 'ready' });
-                    sendSize();
+                    if (!live()) return;
+                    try {
+                        prepared = true;
+                        applyRect();
+                        if (startMs > 0) p.seekTo(startMs, function () {}, function () {});
+                        if (!props.paused) p.play();
+                        emit('state', { state: 'ready' });
+                        sendSize();
+                        if (pendingSeek) seek(pendingSeek);
+                    } catch (e) {
+                        fail(e && e.name || e);
+                    }
                 }, function (e) {
-                    if (my !== token) return;
-                    emit('error', { code: String(e && e.name || e) });
-                    close();
-                    emit('state', { state: 'idle' });
+                    if (live()) fail(e && e.name || e);
                 });
             } catch (e) {
-                emit('error', { code: String(e && e.name || e) });
-                close();
-                emit('state', { state: 'idle' });
+                fail(e && e.name || e);
             }
         }
 
@@ -141,36 +147,45 @@ NshTizen.avplay = (function () {
         }
 
         function stop() {
-            token++;
             var was = owner === ctx;
-            close();
-            if (was) { owner = null; emit('state', { state: 'idle' }); }
+            teardown();
+            hidden = null;
+            if (was) emit('state', { state: 'idle' });
         }
 
-        function same(a, b) { return a && b && a.url === b.url && a.token === b.token; }
+        function same(a, b) { return !!(a && b && a.url === b.url && a.token === b.token); }
 
+        /* A seek for the current token, once per id; before the stream is
+         * ready it waits. */
         function seek(s) {
-            var p = av();
-            if (!s || !opened || (lastSeek && lastSeek.id === s.id) || s.token !== opened.token) return;
-            lastSeek = s;
-            var my = token;
+            if (!s || !opened || s.token !== opened.token || (lastSeek && lastSeek.id === s.id)) return;
+            if (!prepared) { pendingSeek = s; return; }
+            pendingSeek = null;
+            var p = av(), my = token;
             try {
                 p.seekTo(s.ms, function () {
                     if (my !== token) return;
+                    lastSeek = s;
                     var duration = 0;
                     try { duration = p.getDuration(); } catch (e) { /* live */ }
                     emit('timeline', { token: s.token, seekId: s.id, ms: s.ms, durationMs: duration, seekable: duration > 0 });
-                }, function () {});
+                }, function () { /* not seekable: a later seek may try again */ });
             } catch (e) { /* not seekable */ }
         }
 
         function visibility() {
             if (document.hidden) {
-                if (opened) { hiddenSource = opened; token++; close(); }
-            } else if (hiddenSource) {
-                var s = hiddenSource;
-                hiddenSource = null;
-                if (same(s, props.source)) open(s);
+                if (opened && owner === ctx) {
+                    var ms = 0;
+                    try { ms = av().getCurrentTime(); } catch (e) { /* live */ }
+                    hidden = { source: opened, ms: ms };
+                    teardown();
+                }
+            } else if (hidden) {
+                var h = hidden;
+                hidden = null;
+                if (same(h.source, props.source)) open(h.source, h.ms);
+                else if (props.source && props.source.url) open(props.source, 0);
             }
         }
         document.addEventListener('visibilitychange', visibility);
@@ -181,9 +196,11 @@ NshTizen.avplay = (function () {
                 if ('source' in changed) {
                     var s = all.source;
                     if (!s || !s.url) stop();
-                    else if (!same(s, opened)) open(s);
+                    /* Hidden: opened when the page shows again. */
+                    else if (document.hidden) hidden = { source: s, ms: 0 };
+                    else if (!same(s, opened)) open(s, 0);
                 }
-                if ('paused' in changed && opened && owner === ctx) {
+                if ('paused' in changed && opened && owner === ctx && prepared) {
                     try { if (all.paused) av().pause(); else av().play(); } catch (e) { /* not ready */ }
                 }
                 if ('seek' in changed) seek(all.seek);
@@ -192,10 +209,12 @@ NshTizen.avplay = (function () {
             command: function () {},
             destroy: function () {
                 document.removeEventListener('visibilitychange', visibility);
-                token++;
-                close();
-                if (owner === ctx) owner = null;
+                teardown();
+                hidden = null;
             }
         };
-    };
+    }
+
+    factory.api = function () { return typeof webapis !== 'undefined' && webapis.avplay ? webapis.avplay : null; };
+    return factory;
 })();

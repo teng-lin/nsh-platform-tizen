@@ -9,6 +9,10 @@
  * coordinates that moved, a style rewrites `cssText` only when it differs,
  * and a text reuses its runs' spans and text nodes.
  *
+ * Where keys go and the focus of views are decided in the engine (the
+ * page's tree lags a message behind it); the page keeps only the input the
+ * user edits, whose DOM focus is the TV keyboard's.
+ *
  * Plain ES2017: the oldest target is Tizen 5.5 (Chromium 69): no optional
  * chaining, nullish coalescing, flex gap, CSS min()/clamp()/inset.
  */
@@ -21,6 +25,8 @@ var NshTizen = (function () {
     /* nsh_core::tailwind::state::FOCUSED. */
     var FOCUSED = 4;
     var BASE = 'position:absolute;box-sizing:border-box;';
+    /* The TV keyboard's Done and Cancel. */
+    var IME_DONE = 65376, IME_CANCEL = 65385;
 
     /* ---------- native components ---------- */
 
@@ -34,17 +40,34 @@ var NshTizen = (function () {
      *       // ctx.emit(name, data): an event to the app (onNativeEvent),
      *       // ctx.rect(): the container's rect on the page.
      *       return {
-     *           props: function (changed, all) {},  // after every change
+     *           props: function (changed, all, removed) {},  // after every change
      *           frame: function (rect) {},          // {x, y, width, height, visible}
      *           command: function (name, args) {},  // ElementRef::command
      *           destroy: function () {}
      *       };
      *   });
      *
-     * Every method is optional. Props arrive before the first frame.
+     * Every method is optional. Props arrive before the first frame. A
+     * prop set to `null` is in `changed` with the value null; one removed
+     * is named in `removed` and absent from `all`. A component that throws
+     * is reported (`__nsh.errors`) and does not stop the page.
      */
     var components = {};
     function registerComponent(name, factory) { components[name] = factory; }
+
+    /* `url("…")` of `uri`, escaped: image URIs come from apps' data. */
+    function cssUrl(uri) {
+        return 'url("' + String(uri).replace(/["\\]/g, '\\$&').replace(/[\n\r\f]/g, ' ') + '")';
+    }
+
+    /* Whether an <img> may load `uri`: the web, the package, in-memory
+     * images; no `javascript:` or other schemes. */
+    function imageAllowed(uri) {
+        var scheme = /^([a-z][a-z0-9+.-]*):/i.exec(uri);
+        if (!scheme) return true;
+        var s = scheme[1].toLowerCase();
+        return s === 'http' || s === 'https' || s === 'blob' || s === 'file' || (s === 'data' && /^data:image\//i.test(uri));
+    }
 
     /* ---------- the view tree ---------- */
 
@@ -76,13 +99,14 @@ var NshTizen = (function () {
         this.send = send;
         this.M = M;
         this.nodes = {};
-        this.keyListeners = [];
-        this.focused = null;      /* a focusable view the app focused */
         this.editing = null;      /* the input with the DOM focus */
         this.componentNodes = [];
         this.placed = false;      /* a frame or the tree changed in this batch */
         this.blobs = {};          /* in-memory image URI -> blob URL */
         this.autoFocus = null;
+        this.disposed = false;
+        /* Keys an input consumed on the way down: their release is dropped. */
+        this.swallowed = {};
         this.style = document.createElement('style');
         this.style.textContent =
             '@keyframes nsh-spin{to{transform:rotate(360deg)}}' +
@@ -92,17 +116,35 @@ var NshTizen = (function () {
             '.nsh-in{position:absolute;border:0;margin:0;padding:0;background:transparent;outline:none;box-sizing:border-box;resize:none}';
         document.head.appendChild(this.style);
         this.placeholderRules = {};
+        this.phStyle = null;
         var root = new Node(ROOT_ID, 'view');
         root.w = container.clientWidth || 1920;
         root.h = container.clientHeight || 1080;
         root.restyle();
         this.nodes[ROOT_ID] = root;
+        this.container = container;
         container.appendChild(root.el);
     }
 
     var R = Renderer.prototype;
 
+    /* Whether `n` is still this renderer's node: a callback of a view
+     * removed since (or of an old session) must not act. */
+    R.live = function (n) { return !this.disposed && this.nodes[n.id] === n; };
+
+    /* A host component's method, isolated: its throw is reported. */
+    R.guard = function (n, what, f) {
+        try { return f(); } catch (e) {
+            var text = 'component ' + (n.comp ? n.comp.name : '?') + ' ' + what + ': ' + String(e && e.stack || e);
+            this.M.errors.push(text.slice(0, 500));
+            if (this.M.errors.length > 20) this.M.errors.shift();
+            if (typeof console !== 'undefined') console.error(text);
+            return undefined;
+        }
+    };
+
     R.apply = function (ops) {
+        if (this.disposed) return;
         var started = performance.now();
         var M = this.M;
         this.placed = false;
@@ -118,17 +160,13 @@ var NshTizen = (function () {
             switch (op[0]) {
             case 'c': this.create(op[1], op[2]); break;
             case 'i': this.insert(n, this.nodes[op[2]], op[3]); break;
-            case 'r':
-                if (n && n.el.parentNode) n.el.parentNode.removeChild(n.el);
-                if (n) n.parent = null;
-                this.placed = true;
-                break;
+            case 'r': if (n) this.detach(n); break;
             case 'd': if (n) this.destroy(n); break;
             case 'f': if (n) this.frame(n, op[2], op[3], op[4], op[5]); break;
             case 's': if (n && n.css !== op[2]) { n.css = op[2]; n.restyle(); } break;
             case 'a': if (n && n.anim !== op[2]) { n.anim = op[2]; n.restyle(); } break;
             case 't': if (n) this.text(n, op[2]); break;
-            case 'e': if (n) this.setEvents(n, op[2]); break;
+            case 'e': if (n) n.events = op[2]; break;
             case 'ts': if (n) n.states = op[2]; break;
             case 'vp':
                 if (n) {
@@ -141,14 +179,18 @@ var NshTizen = (function () {
             case 'st': if (n) this.scrollTo(n, op[2], op[3]); break;
             case 'sb': if (n) this.scrollTo(n, n.sx + op[2], n.sy + op[3]); break;
             case 'im': if (n) this.image(n, op); break;
+            case 'ir': this.releaseImage(op[1]); break;
             case 'in': if (n) this.inputConfig(n, op[2]); break;
             case 'iv': if (n && n.input) this.inputValue(n, op[2], op[3]); break;
             case 'ic': if (n && n.input) this.inputContent(n, op[2], op[3], op[4], op[5]); break;
             case 'fo': if (n) this.focus(n, op[2]); break;
             case 'n': if (n) this.component(n, op[2]); break;
-            case 'np': if (n && n.comp) this.componentProps(n, op[2]); break;
+            case 'np': if (n && n.comp) this.componentProps(n, op[2], op[3] || []); break;
             case 'nc':
-                if (n && n.comp && n.comp.instance.command) n.comp.instance.command(op[2], op[3]);
+                if (n && n.comp && n.comp.instance.command) {
+                    var inst = n.comp.instance, name = op[2], args = op[3];
+                    this.guard(n, 'command', function () { inst.command(name, args); });
+                }
                 break;
             case 'x': this.exit(); break;
             default:
@@ -159,7 +201,7 @@ var NshTizen = (function () {
         if (this.autoFocus) {
             var a = this.autoFocus;
             this.autoFocus = null;
-            if (a.input && a.el.parentNode) a.input.el.focus();
+            if (a.input && this.live(a) && this.attached(a)) a.input.el.focus();
         }
         M.batches++;
         M.ops += ops.length;
@@ -175,6 +217,7 @@ var NshTizen = (function () {
         if (kind === 'scroll') {
             var self = this;
             n.el.addEventListener('scroll', function () {
+                if (!self.live(n)) return;
                 if (n.el.scrollLeft === n.sx && n.el.scrollTop === n.sy) return;
                 n.sx = n.el.scrollLeft; n.sy = n.el.scrollTop;
                 self.send({ t: 'scroll', id: id, x: n.sx, y: n.sy });
@@ -192,17 +235,27 @@ var NshTizen = (function () {
         if (child.input && child.input.config.auto) this.autoFocus = child;
     };
 
+    /* A detached subtree keeps no DOM focus: the TV keyboard closes. */
+    R.detach = function (n) {
+        if (n.el.parentNode) n.el.parentNode.removeChild(n.el);
+        n.parent = null;
+        if (this.editing && !this.attached(this.editing)) this.editing.input.el.blur();
+        this.placed = true;
+    };
+
     R.destroy = function (n) {
         if (n.el.parentNode) n.el.parentNode.removeChild(n.el);
         if (n.comp) {
-            if (n.comp.instance.destroy) n.comp.instance.destroy();
+            var inst = n.comp.instance;
+            if (inst.destroy) this.guard(n, 'destroy', function () { inst.destroy(); });
             this.componentNodes.splice(this.componentNodes.indexOf(n), 1);
             n.comp = null;
         }
-        if (this.editing === n) this.editing = null;
-        if (this.focused === n) this.focused = null;
-        var k = this.keyListeners.indexOf(n);
-        if (k >= 0) this.keyListeners.splice(k, 1);
+        if (n.input) {
+            if (this.editing === n) { this.editing = null; n.input.el.blur(); }
+            this.setPlaceholderRule(n.id, '');
+        }
+        if (n.img) { n.img.el.onload = null; n.img.el.onerror = null; }
         n.parent = null;
         delete this.nodes[n.id];
         this.placed = true;
@@ -216,16 +269,6 @@ var NshTizen = (function () {
         if (n.w !== w) { n.w = w; s.width = w + 'px'; }
         if (n.h !== h) { n.h = h; s.height = h + 'px'; }
         this.placed = true;
-    };
-
-    R.setEvents = function (n, bits) {
-        n.events = bits;
-        var k = this.keyListeners.indexOf(n);
-        if (bits & KEYS) {
-            if (k < 0) this.keyListeners.push(n);
-        } else if (k >= 0) {
-            this.keyListeners.splice(k, 1);
-        }
     };
 
     /*
@@ -295,10 +338,19 @@ var NshTizen = (function () {
 
     /* ---------- images ---------- */
 
-    /* An in-memory image's bytes (`image_bytes`), shown by its URI. */
-    R.imageBytes = function (uri, bytes) {
+    /* An in-memory image's bytes (`image_bytes`), shown by its URI, as a
+     * blob of its type (an SVG without one does not load). */
+    R.imageBytes = function (uri, type, bytes) {
         if (this.blobs[uri]) return;
-        this.blobs[uri] = URL.createObjectURL(new Blob([bytes]));
+        this.blobs[uri] = URL.createObjectURL(type ? new Blob([bytes], { type: type }) : new Blob([bytes]));
+    };
+
+    /* No view shows in-memory image `uri` any more (op `ir`). */
+    R.releaseImage = function (uri) {
+        var url = this.blobs[uri];
+        if (!url) return;
+        delete this.blobs[uri];
+        URL.revokeObjectURL(url);
     };
 
     R.src = function (uri) { return this.blobs[uri] || uri; };
@@ -306,14 +358,18 @@ var NshTizen = (function () {
     R.image = function (n, op) {
         var self = this;
         var src = op[2], fit = op[3], placeholder = op[4], blur = op[5], position = op[6], tint = op[7];
+        if (src && !imageAllowed(src)) { this.M.blockedImages = (this.M.blockedImages || 0) + 1; src = null; }
+        if (placeholder && !imageAllowed(placeholder)) placeholder = null;
         if (!n.img) {
             var img = document.createElement('img');
             img.onload = function () {
+                if (!self.live(n)) return;
                 img.style.backgroundImage = '';
                 if (n.events & LOAD) self.send({ t: 'image', id: n.id, ok: 1, w: img.naturalWidth, h: img.naturalHeight });
             };
             img.onerror = function () {
-                if (n.events & ERROR) self.send({ t: 'image', id: n.id, ok: 0, error: 'could not load ' + img.src });
+                if (!self.live(n) || !n.img.src) return;
+                if (n.events & ERROR) self.send({ t: 'image', id: n.id, ok: 0, error: 'could not load the image' });
             };
             n.img = { el: img, mask: null, src: null };
             n.el.insertBefore(img, n.el.firstChild);
@@ -324,23 +380,25 @@ var NshTizen = (function () {
             if (!im.mask) {
                 im.mask = document.createElement('div');
                 n.el.insertBefore(im.mask, im.el);
-                im.el.style.display = 'none';
             }
-            var url = src ? 'url("' + this.src(src) + '")' : 'none';
-            var size = fit === 'cover' ? 'cover' : fit === 'fill' ? '100% 100%' : 'contain';
-            im.mask.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;background-color:' + tint +
-                ';-webkit-mask-image:' + url + ';-webkit-mask-size:' + size + ';-webkit-mask-repeat:no-repeat;-webkit-mask-position:' +
-                (position || 'center') + ';';
+            var ms = im.mask.style;
+            ms.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;-webkit-mask-repeat:no-repeat;';
+            ms.setProperty('background-color', tint);
+            ms.setProperty('-webkit-mask-image', src ? cssUrl(this.src(src)) : 'none');
+            ms.setProperty('-webkit-mask-size', fit === 'cover' ? 'cover' : fit === 'fill' ? '100% 100%' : 'contain');
+            ms.setProperty('-webkit-mask-position', position || 'center');
         } else if (im.mask) {
             n.el.removeChild(im.mask);
             im.mask = null;
-            im.el.style.display = '';
         }
-        im.el.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;object-fit:' + fit + ';' +
-            (position ? 'object-position:' + position + ';' : '') + (blur > 0 ? 'filter:blur(' + blur + 'px);' : '') +
-            (placeholder ? 'background:url("' + this.src(placeholder) + '") center/contain no-repeat;' : '') +
-            (tint ? 'display:none;' : '');
+        var s = im.el.style;
+        s.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;';
+        s.setProperty('object-fit', fit);
+        if (position) s.setProperty('object-position', position);
+        if (blur > 0) s.setProperty('filter', 'blur(' + blur + 'px)');
+        if (placeholder) s.setProperty('background', cssUrl(this.src(placeholder)) + ' center/contain no-repeat');
         /* The element still loads the source under a mask, for its events. */
+        if (tint) s.setProperty('display', 'none');
         var resolved = src ? this.src(src) : null;
         if (im.src === resolved) return;
         im.src = resolved;
@@ -354,44 +412,71 @@ var NshTizen = (function () {
 
     /* ---------- inputs ---------- */
 
+    /*
+     * The <input> (or <textarea>) of input `n`. Made again when `multiline`
+     * changes: the text, the focus and the selection move to the new
+     * element, and the swap reports no Blur or Focus.
+     */
     R.makeInput = function (n, multiline) {
         var self = this;
         var old = n.input;
         var el = document.createElement(multiline ? 'textarea' : 'input');
         el.className = 'nsh-in';
         el.id = 'nsh-in-' + n.id;
-        var input = n.input = { el: el, config: old ? old.config : {}, count: old ? old.count : 0, box: old ? old.box : null };
-        if (old) {
-            el.value = old.el.value;
-            n.el.replaceChild(el, old.el);
-        } else {
-            n.el.appendChild(el);
-        }
+        var input = n.input = { el: el, config: old ? old.config : {}, count: old ? old.count : 0, box: old ? old.box : null, css: old ? old.css : '', swapping: false };
         el.addEventListener('input', function () {
+            if (!self.live(n) || n.input !== input) return;
             input.count++;
             self.send({ t: 'text', id: n.id, name: 'onChangeText', text: el.value, count: input.count });
         });
         el.addEventListener('keydown', function (e) {
+            if (!self.live(n) || n.input !== input) return;
             var submit = input.config.submit || 'blur';
-            /* Enter, or the TV keyboard's Done (65376). */
-            if ((e.keyCode === 13 || e.keyCode === 65376) && !(submit === 'newline' && e.keyCode === 13)) {
+            var code = e.keyCode;
+            /* Enter, or the TV keyboard's Done. */
+            if ((code === 13 || code === IME_DONE) && !(submit === 'newline' && code === 13)) {
                 e.preventDefault();
+                self.consume(e);
                 self.send({ t: 'text', id: n.id, name: 'onSubmitEditing', text: el.value, count: input.count });
                 if (submit === 'blur') el.blur();
-            } else if (e.keyCode === 65385) {
-                /* The keyboard's Cancel. */
+            } else if (code === IME_CANCEL) {
+                self.consume(e);
                 el.blur();
             }
         });
         el.addEventListener('focus', function () {
+            if (!self.live(n) || n.input !== input || input.swapping) return;
             self.editing = n;
-            self.focusChanged(n, true);
+            self.inputFocus(n, true);
         });
         el.addEventListener('blur', function () {
+            if (!self.live(n) || n.input !== input || input.swapping) return;
             if (self.editing === n) self.editing = null;
-            self.focusChanged(n, false);
+            self.inputFocus(n, false);
         });
+        if (old) {
+            var focused = document.activeElement === old.el;
+            var start = old.el.selectionStart, end = old.el.selectionEnd;
+            el.value = old.el.value;
+            old.swapping = true;
+            input.swapping = true;
+            n.el.replaceChild(el, old.el);
+            if (focused) {
+                el.focus();
+                try { el.setSelectionRange(start, end); } catch (e) { /* a number input has none */ }
+            }
+            input.swapping = false;
+        } else {
+            n.el.appendChild(el);
+        }
         if (input.box) this.inputContent(n, input.box[0], input.box[1], input.box[2], input.box[3]);
+    };
+
+    /* An input handled key `e` itself: the page's key listener must not
+     * see it, nor its release. */
+    R.consume = function (e) {
+        e.stopPropagation();
+        this.swallowed[e.keyCode] = true;
     };
 
     R.inputConfig = function (n, c) {
@@ -405,14 +490,16 @@ var NshTizen = (function () {
         input.css = c.css;
         this.inputContent(n, input.box ? input.box[0] : 0, input.box ? input.box[1] : 0,
             input.box ? input.box[2] : n.w, input.box ? input.box[3] : n.h);
-        var rule = c.phc ? '#nsh-in-' + n.id + '::placeholder{color:' + c.phc + '}' : '';
-        if (this.placeholderRules[n.id] !== rule) {
-            this.placeholderRules[n.id] = rule;
-            var all = '';
-            for (var k in this.placeholderRules) all += this.placeholderRules[k];
-            if (!this.phStyle) { this.phStyle = document.createElement('style'); document.head.appendChild(this.phStyle); }
-            this.phStyle.textContent = all;
-        }
+        this.setPlaceholderRule(n.id, c.phc ? '#nsh-in-' + n.id + '::placeholder{color:' + c.phc + '}' : '');
+    };
+
+    R.setPlaceholderRule = function (id, rule) {
+        if ((this.placeholderRules[id] || '') === rule) return;
+        if (rule) this.placeholderRules[id] = rule; else delete this.placeholderRules[id];
+        var all = '';
+        for (var k in this.placeholderRules) all += this.placeholderRules[k];
+        if (!this.phStyle) { this.phStyle = document.createElement('style'); document.head.appendChild(this.phStyle); }
+        this.phStyle.textContent = all;
     };
 
     R.inputContent = function (n, x, y, w, h) {
@@ -430,43 +517,27 @@ var NshTizen = (function () {
 
     /* ---------- focus ---------- */
 
+    /*
+     * `fo`: an input takes or leaves the DOM focus (the TV keyboard); a
+     * view the app focused takes it from the input being edited, so the
+     * keyboard closes when the focus moves off it. The engine reports the
+     * views' own Focus and Blur.
+     */
     R.focus = function (n, on) {
         if (n.input) {
-            if (on) n.input.el.focus(); else n.input.el.blur();
+            if (on && this.attached(n)) n.input.el.focus();
+            else if (!on) n.input.el.blur();
             return;
         }
-        if (on) {
-            if (this.focused === n) return;
-            var old = this.focused;
-            this.focused = n;
-            if (old) this.focusChanged(old, false);
-            if (this.editing) this.editing.input.el.blur();
-            this.focusChanged(n, true);
-        } else if (this.focused === n) {
-            this.focused = null;
-            this.focusChanged(n, false);
-        }
+        if (on && this.editing && this.editing !== n) this.editing.input.el.blur();
     };
 
-    /* Focus and Blur, and the focused state where the core tracks it. */
-    R.focusChanged = function (n, on) {
-        if (!this.nodes[n.id]) return;
+    /* An input's Focus and Blur, and its focused state where the core
+     * tracks it. */
+    R.inputFocus = function (n, on) {
+        if (!this.live(n)) return;
         this.send({ t: 'focus', id: n.id, on: on ? 1 : 0 });
         if (n.states & FOCUSED) this.send({ t: 'states', id: n.id, states: on ? FOCUSED : 0 });
-    };
-
-    /*
-     * Where a remote key goes: the input being edited, else the view the
-     * app focused, else the newest view listening for keys (an app's root
-     * view listens before any focus exists), else the root.
-     */
-    R.keyTarget = function () {
-        if (this.editing) return this.editing;
-        if (this.focused && this.nodes[this.focused.id]) return this.focused;
-        for (var i = this.keyListeners.length - 1; i >= 0; i--) {
-            if (this.attached(this.keyListeners[i])) return this.keyListeners[i];
-        }
-        return this.nodes[ROOT_ID];
     };
 
     R.attached = function (n) {
@@ -483,29 +554,31 @@ var NshTizen = (function () {
             this.M.unknownComponents[name] = (this.M.unknownComponents[name] || 0) + 1;
             return;
         }
-        var comp = { name: name, props: {}, rect: null, instance: null };
+        var comp = { name: name, props: {}, rect: null, instance: {} };
+        n.comp = comp;
         var ctx = {
             id: n.id,
             name: name,
             element: n.el,
             emit: function (event, data) {
-                if (!self.nodes[n.id]) return;
-                self.send({ t: 'native', id: n.id, name: event, data: JSON.stringify(data === undefined ? null : data) });
+                if (!self.live(n) || n.comp !== comp) return;
+                var json;
+                try { json = JSON.stringify(data === undefined ? null : data); } catch (e) { json = 'null'; }
+                self.send({ t: 'native', id: n.id, name: String(event), data: json });
             },
             rect: function () { return self.rectOf(n); }
         };
-        comp.instance = factory(ctx) || {};
-        n.comp = comp;
+        comp.instance = this.guard(n, 'factory', function () { return factory(ctx); }) || {};
         this.componentNodes.push(n);
         this.placed = true;
     };
 
-    R.componentProps = function (n, changed) {
+    R.componentProps = function (n, changed, removed) {
         var props = n.comp.props;
-        for (var k in changed) {
-            if (changed[k] === null) delete props[k]; else props[k] = changed[k];
-        }
-        if (n.comp.instance.props) n.comp.instance.props(changed, props);
+        for (var k in changed) props[k] = changed[k];
+        for (var i = 0; i < removed.length; i++) delete props[removed[i]];
+        var inst = n.comp.instance;
+        if (inst.props) this.guard(n, 'props', function () { inst.props(changed, props, removed); });
     };
 
     /* A view's rect on the page: its frames summed, scroll offsets taken. */
@@ -525,7 +598,8 @@ var NshTizen = (function () {
             var r = this.rectOf(n), o = n.comp.rect;
             if (o && o.x === r.x && o.y === r.y && o.width === r.width && o.height === r.height && o.visible === r.visible) continue;
             n.comp.rect = r;
-            if (n.comp.instance.frame) n.comp.instance.frame(r);
+            var inst = n.comp.instance;
+            if (inst.frame) this.guard(n, 'frame', function () { inst.frame(r); });
         }
     };
 
@@ -534,12 +608,40 @@ var NshTizen = (function () {
         try { tizen.application.getCurrentApplication().exit(); } catch (e) { /* not a TV */ }
     };
 
+    /* Ends this renderer (a new session replaces it): components are
+     * destroyed, the DOM and styles removed, blobs released. */
+    R.dispose = function () {
+        if (this.disposed) return;
+        for (var id in this.nodes) {
+            var n = this.nodes[id];
+            if (n.comp && n.comp.instance.destroy) {
+                var inst = n.comp.instance;
+                this.guard(n, 'destroy', function () { inst.destroy(); });
+            }
+        }
+        if (this.editing) this.editing.input.el.blur();
+        this.disposed = true;
+        var root = this.nodes[ROOT_ID];
+        if (root && root.el.parentNode) root.el.parentNode.removeChild(root.el);
+        if (this.style.parentNode) this.style.parentNode.removeChild(this.style);
+        if (this.phStyle && this.phStyle.parentNode) this.phStyle.parentNode.removeChild(this.phStyle);
+        for (var uri in this.blobs) URL.revokeObjectURL(this.blobs[uri]);
+        this.blobs = {};
+        this.nodes = {};
+        this.componentNodes = [];
+    };
+
     return {
         ROOT_ID: ROOT_ID,
         PRESS: PRESS,
+        KEYS: KEYS,
         FOCUS_BITS: FOCUS_BITS,
+        IME_DONE: IME_DONE,
+        IME_CANCEL: IME_CANCEL,
         registerComponent: registerComponent,
         components: components,
-        Renderer: Renderer
+        Renderer: Renderer,
+        imageAllowed: imageAllowed,
+        cssUrl: cssUrl
     };
 })();

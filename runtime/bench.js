@@ -1,6 +1,7 @@
-
+'use strict';
 /*
- * The shared benchmark (appended to the page script by build.sh): 32 moves
+ * The shared benchmark, nsh-bench.js: only benchmark builds load it
+ * (build.sh NSH_BENCH=1), after nsh-tizen.js. 32 moves
  * 350 ms apart, first idle, then while the app's thread works 30 ms of
  * every 50 ms, with video playing under the page. Records key to painted
  * frame, page frame gaps, and per key the DOM apply, JSON parse and
@@ -9,8 +10,8 @@
  * NshTizen.runBench(done).
  */
 (function (api) {
-    var M = api.metrics;
     function run(done) {
+        var M = api.metrics;
         var seqKeys = ['ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown',
             'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowDown', 'ArrowRight', 'ArrowRight', 'ArrowRight', 'ArrowRight',
             'ArrowRight', 'ArrowRight', 'ArrowUp', 'ArrowUp', 'ArrowUp', 'ArrowUp', 'ArrowUp', 'ArrowUp', 'ArrowUp',

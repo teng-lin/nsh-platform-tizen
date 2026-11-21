@@ -70,12 +70,12 @@ impl Anim {
         self.animator.scrolled(id, offset)
     }
 
-    /// Animations that finished since the last call.
     /// Whether animations finished that were not yet reported.
     pub(crate) fn has_finished(&self) -> bool {
         !self.animator.finished.is_empty()
     }
 
+    /// Animations that finished since the last call.
     pub(crate) fn finished(&mut self) -> Vec<Finished> {
         std::mem::take(&mut self.animator.finished)
     }

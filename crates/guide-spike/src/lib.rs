@@ -532,16 +532,16 @@ mod tests {
         )
         .unwrap();
         let first = ops(&rt.pump());
-        let listener = first
-            .iter()
-            .find(|op| op[0] == "e" && op[2].as_u64().unwrap() & 8 == 8)
-            .map(|op| op[1].as_u64().unwrap() as u32)
-            .expect("the guide listens for keys");
+        assert!(
+            first
+                .iter()
+                .any(|op| op[0] == "e" && op[2].as_u64().unwrap() & 8 == 8),
+            "the guide listens for keys"
+        );
         // Nothing focused: keys are reported at the root and start at the
         // guide mounted there (the core's key_start), as on NSH's own
         // backends.
         assert_eq!(rt.key_target(), nsh_core::ROOT_ID);
-        let _ = listener;
         let created = first.iter().filter(|op| op[0] == "c").count();
         let down = ops(&rt.remote_key(0, 40, "", "", true, false));
         let right = ops(&rt.remote_key(0, 39, "", "", true, false));

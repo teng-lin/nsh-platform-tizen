@@ -28,6 +28,8 @@
 //! runtime calls.
 
 mod anim;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod calls;
 pub mod canvas;
 mod effects;
 pub mod encode;
@@ -453,6 +455,8 @@ pub struct Runtime<M: Measure + 'static> {
     engine: LocalEngine<TizenTextEngine<M>>,
     control: EngineControl,
     outbox: Arc<Mutex<Outbox>>,
+    /// The last key transition's capture decision.
+    captured: bool,
 }
 
 impl<M: Measure + 'static> Runtime<M> {
@@ -477,6 +481,7 @@ impl<M: Measure + 'static> Runtime<M> {
             engine,
             control,
             outbox,
+            captured: false,
         })
     }
 
@@ -630,6 +635,32 @@ impl<M: Measure + 'static> Runtime<M> {
     /// A key went down or up on view `id`: `key` and `code` as the DOM
     /// spells them. The core routes it to `id` and its listening ancestors.
     pub fn key(&mut self, id: u32, key: &str, code: &str, down: bool, repeat: bool) -> Pumped {
+        self.settle();
+        self.send_key(id, key, code, down, repeat);
+        self.pump()
+    }
+
+    /// Whether the app's `captureKeys` took the last key transition sent
+    /// ([`nsh_core::KeyEvent::default_prevented`]).
+    pub fn key_captured(&self) -> bool {
+        self.captured
+    }
+
+    /// Runs what the last pumps left for the engine (focus transitions,
+    /// finished animations, answers) before input that depends on it: a
+    /// key after a focus change goes where the focus is now.
+    fn settle(&mut self) {
+        for _ in 0..PUMP_ROUNDS {
+            if !self.report_back() {
+                break;
+            }
+            self.engine.pump();
+        }
+    }
+
+    /// Hands one key transition to the engine without pumping; true when
+    /// the app's `captureKeys` took it.
+    fn send_key(&mut self, id: u32, key: &str, code: &str, down: bool, repeat: bool) -> bool {
         let mut event = nsh_core::keyboard::KeyEvent::default();
         event.key = key.to_owned().into();
         event.code = code.to_owned().into();
@@ -639,16 +670,18 @@ impl<M: Measure + 'static> Runtime<M> {
         } else {
             EventKind::KeyUp
         };
-        // The engine's own entry for a key: it sets `default_prevented`
-        // from the mounted `captureKeys` rules (the page cannot wait for
-        // that decision, so it prevents the default of every remote key).
-        self.engine
-            .key_event(id, kind, EventPayload::Key(event), keys::stroke(key));
-        self.pump()
+        // The engine's own entry for a key (`#[doc(hidden)]` in NSH; its web
+        // backend uses it too): it sets `default_prevented` from the
+        // mounted `captureKeys` rules (the page cannot wait for that
+        // decision, so it prevents the default of every remote key).
+        self.captured =
+            self.engine
+                .key_event(id, kind, EventPayload::Key(event), keys::stroke(key));
+        self.captured
     }
 
     /// The view a key would go to now ([`route`]): the focused view while
-    /// attached, else the newest attached key listener, else the root.
+    /// attached, else an open modal's content, else the root.
     pub fn key_target(&self) -> u32 {
         self.lock().routes.target()
     }
@@ -657,8 +690,9 @@ impl<M: Measure + 'static> Runtime<M> {
     /// reported as `dom_key` / `dom_code`, with the DOM's name for it
     /// ([`keys::key_name`]). `id` 0 lets the platform choose its view
     /// ([`Runtime::key_target`]); the page names one only for the input
-    /// being edited. OK on a focused view that takes presses presses it.
-    /// A release goes where its press went.
+    /// being edited. OK on a focused view that takes presses is a key
+    /// there and, when the app's `captureKeys` did not take it, presses it.
+    /// Repeats and the release go where the press went.
     pub fn remote_key(
         &mut self,
         id: u32,
@@ -669,15 +703,26 @@ impl<M: Measure + 'static> Runtime<M> {
         repeat: bool,
     ) -> Pumped {
         let key = keys::key_name(key_code, dom_key).to_owned();
+        self.settle();
         let route = self
             .lock()
             .routes
             .route(key_code, key == "Enter", down, repeat, id);
         match route {
-            route::Route::Key(target) => self.key(target, &key, dom_code, down, repeat),
-            route::Route::Press(target) if down && !repeat => self.event(target, "onPress"),
-            route::Route::Press(_) | route::Route::Drop => self.pump(),
+            route::Route::Key(target) => {
+                self.send_key(target, &key, dom_code, down, repeat);
+            }
+            route::Route::Press(target) => {
+                let captured = self.send_key(target, &key, dom_code, down, repeat);
+                // The press is OK's default: only when nothing took the key.
+                if down && !repeat && !captured {
+                    self.control
+                        .dispatch_event(target, EventKind::Press, EventPayload::None);
+                }
+            }
+            route::Route::Drop => {}
         }
+        self.pump()
     }
 
     /// Native component `id` emitted `name` with `data`.
@@ -700,10 +745,13 @@ impl<M: Measure + 'static> Runtime<M> {
             // The view's Blur comes before the input's Focus.
             let transitions = {
                 let mut outbox = self.lock();
-                outbox.routes.input_focused();
+                outbox.routes.input_focused(id);
                 std::mem::take(&mut outbox.routes.transitions)
             };
             self.transitions(transitions);
+        } else if !self.lock().routes.input_blurred(id) {
+            // A view took the focus from it: its Blur went first already.
+            return self.pump();
         }
         let kind = if focused {
             EventKind::Focus
@@ -1407,6 +1455,7 @@ mod tests {
     #[component]
     fn Menu() -> impl IntoElement {
         let pressed = signal(String::from("none"));
+        let released = signal(0u32);
         let focus = element_ref();
         let other = element_ref();
         view()
@@ -1415,6 +1464,11 @@ mod tests {
                 "Enter" => pressed.set("key Enter".into()),
                 "1" => focus.focus(),
                 _ => {}
+            })
+            .on_key_up(move |e: &KeyEvent| {
+                if &*e.key == "Enter" {
+                    released.update(|n| *n += 1);
+                }
             })
             .child(
                 view()
@@ -1433,6 +1487,7 @@ mod tests {
                     .on_press(move || pressed.set("second".into())),
             )
             .child(text(move || pressed.get()))
+            .child(text(move || format!("up {}", released.get())))
     }
 
     #[test]
@@ -1444,10 +1499,127 @@ mod tests {
         // the move: the platform routes OK by the focus Down just set.
         runtime.remote_key(0, 40, "", "", true, false);
         let ok = runtime.remote_key(0, 13, "", "", true, false);
-        assert_eq!(texts(&ok), ["second"]);
-        // Its release presses nothing again.
+        assert_eq!(
+            texts(&ok),
+            ["second"],
+            "the press, after the key (nothing captured it)"
+        );
+        // Its release is the key's release (paired, bubbling), and presses
+        // nothing again.
+        assert_eq!(
+            texts(&runtime.remote_key(0, 13, "", "", false, false)),
+            ["up 1"]
+        );
+        // A release without a press reaches nobody.
         assert!(texts(&runtime.remote_key(0, 13, "", "", false, false)).is_empty());
         runtime.remote_key(0, 40, "", "", false, false);
+    }
+
+    #[component]
+    fn Captures() -> impl IntoElement {
+        let seen = signal(String::from("none"));
+        let pressed = signal(false);
+        let button = element_ref();
+        view()
+            .capture_keys(nsh_core::KeyCapture::keys([
+                nsh_core::keymap::Keystroke::parse_with("up", false).unwrap(),
+                nsh_core::keymap::Keystroke::parse_with("enter", false).unwrap(),
+            ]))
+            .on_key_down(move |e: &KeyEvent| {
+                if &*e.key == "1" {
+                    button.focus();
+                }
+                seen.set(format!("{} {}", e.key, e.default_prevented));
+            })
+            .child(
+                view()
+                    .element_ref(&button)
+                    .focusable(true)
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .on_press(move || pressed.set(true)),
+            )
+            .child(text(move || format!("{} {}", seen.get(), pressed.get())))
+    }
+
+    /// The app's `captureKeys` decides `default_prevented`, and OK it
+    /// captures presses nothing.
+    #[test]
+    fn capture_keys_decides_and_keeps_ok_from_pressing() {
+        let (mut runtime, _) = start(Root::of::<Captures>());
+        assert_eq!(
+            texts(&runtime.remote_key(0, 38, "", "", true, false)),
+            ["ArrowUp true false"]
+        );
+        assert!(runtime.key_captured());
+        runtime.remote_key(0, 38, "", "", false, false);
+        assert_eq!(
+            texts(&runtime.remote_key(0, 40, "", "", true, false)),
+            ["ArrowDown false false"]
+        );
+        assert!(!runtime.key_captured());
+        runtime.remote_key(0, 40, "", "", false, false);
+        runtime.remote_key(0, 49, "1", "", true, false);
+        runtime.remote_key(0, 49, "1", "", false, false);
+        let ok = runtime.remote_key(0, 13, "", "", true, false);
+        assert_eq!(texts(&ok), ["Enter true false"], "captured: no press");
+    }
+
+    #[component]
+    fn Dialog() -> impl IntoElement {
+        let heard = signal(String::new());
+        view()
+            .on_key_down(move |_: &KeyEvent| heard.update(|h| h.push_str("background ")))
+            .child(text(move || heard.get()))
+            .child(
+                nsh_core::element::modal().child(
+                    view()
+                        .w(px(100.0))
+                        .h(px(100.0))
+                        .on_key_down(move |_: &KeyEvent| heard.update(|h| h.push_str("dialog "))),
+                ),
+            )
+    }
+
+    /// With a modal open and nothing focused, its content hears keys first
+    /// (then, as on NSH's own backends, its logical ancestors).
+    #[test]
+    fn an_open_modals_content_hears_keys() {
+        let (mut runtime, _) = start(Root::of::<Dialog>());
+        let heard = texts(&runtime.remote_key(0, 40, "", "", true, false));
+        assert_eq!(heard, ["dialog background"], "{heard:?}");
+    }
+
+    #[component]
+    fn PingPong() -> impl IntoElement {
+        let a = element_ref();
+        let b = element_ref();
+        view()
+            .on_key_down(move |_: &KeyEvent| a.focus())
+            .child(
+                view()
+                    .element_ref(&a)
+                    .focusable(true)
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .on_focus(move || b.focus()),
+            )
+            .child(
+                view()
+                    .element_ref(&b)
+                    .focusable(true)
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .on_focus(move || a.focus()),
+            )
+    }
+
+    /// Work the last report-back round left asks for a pump at once.
+    #[test]
+    fn work_left_after_the_rounds_pumps_again_at_once() {
+        let (mut runtime, _) = start(Root::of::<PingPong>());
+        let pumped = runtime.remote_key(0, 40, "", "", true, false);
+        assert_eq!(pumped.next, Some(0.0));
     }
 
     #[test]

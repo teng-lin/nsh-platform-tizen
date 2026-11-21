@@ -180,6 +180,24 @@ mod tests {
     }
 
     #[test]
+    fn strokes_for_capture_matching() {
+        use nsh_core::keymap::{Key, Keystroke};
+        let plain = |key| {
+            Some(Keystroke {
+                modifiers: Default::default(),
+                key,
+            })
+        };
+        assert_eq!(stroke("ArrowUp"), plain(Key::Up));
+        assert_eq!(stroke("Enter"), plain(Key::Enter));
+        assert_eq!(stroke("7"), plain(Key::Char('7')));
+        assert_eq!(stroke("-"), plain(Key::Char('-')));
+        assert_eq!(stroke("Enter"), Keystroke::parse_with("enter", false).ok());
+        assert_eq!(stroke("ColorF0Red"), None);
+        assert_eq!(stroke("12"), None);
+    }
+
+    #[test]
     fn unknown_codes_keep_the_browsers_name() {
         assert_eq!(key_name(65, "a"), "a");
         assert_eq!(key_name(9999, ""), "Unidentified");

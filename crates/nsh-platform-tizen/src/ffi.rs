@@ -227,44 +227,33 @@ fn deliver(pumped: Pumped) {
 type Call = Box<dyn FnOnce(&mut Runtime<HostMeasure>) -> Pumped>;
 
 thread_local! {
-    /// Calls that arrived while the runtime was busy (a host import calling
-    /// back into the module during a pump, or during the delivery of what a
-    /// pump made) or not yet there (during the start). They run, in order,
-    /// when the outer call ends.
-    static QUEUED: RefCell<std::collections::VecDeque<Call>> = RefCell::default();
-    /// What a pump made is being handed to JS.
-    static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// The app is starting: its runtime is not installed yet.
-    static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Calls that arrived while another ran (a host import calling back
+    /// into the module during a pump, or during the delivery of what a
+    /// pump made) or while the app starts: they run, in order, when the
+    /// outer call ends ([`crate::calls`]).
+    static CALLS: RefCell<crate::calls::Calls<Call>> = RefCell::default();
 }
 
 /// Runs `f` on the runtime and hands its result to JS, then what was
-/// queued meanwhile. Re-entered (the runtime is borrowed, its output being
-/// delivered, or the app still starting), it queues `f` behind the calls
-/// already waiting instead of aborting the module on a second borrow or
-/// running ahead of them.
+/// queued meanwhile, each delivered before the next. Re-entered, it queues
+/// `f` behind the calls already waiting instead of aborting the module on
+/// a second borrow or running ahead of them.
 fn with_runtime(f: impl FnOnce(&mut Runtime<HostMeasure>) -> Pumped + 'static) {
-    let busy = STARTING.with(|s| s.get())
-        || DELIVERING.with(|d| d.get())
-        || RUNTIME.with(|r| r.try_borrow_mut().is_err());
-    if busy {
-        QUEUED.with(|q| q.borrow_mut().push_back(Box::new(f)));
-        return;
+    let first = CALLS.with(|c| c.borrow_mut().admit(Box::new(f) as Call));
+    if let Some(first) = first {
+        run(first);
     }
-    run(Box::new(f));
 }
 
-/// Runs `first`, then every queued call, each delivered before the next.
+/// Runs `first` and then the queued calls; the queue is busy meanwhile.
 fn run(first: Call) {
     let mut next = Some(first);
     while let Some(call) = next.take() {
         let pumped = RUNTIME.with(|r| r.borrow_mut().as_mut().map(call));
         if let Some(pumped) = pumped {
-            DELIVERING.with(|d| d.set(true));
             deliver(pumped);
-            DELIVERING.with(|d| d.set(false));
         }
-        next = QUEUED.with(|q| q.borrow_mut().pop_front());
+        next = CALLS.with(|c| c.borrow_mut().next());
     }
 }
 
@@ -319,17 +308,17 @@ pub extern "C" fn nsh_tz_start(
     let keys = crate::keys::keys_json();
     // SAFETY: a live string JS only reads during the call.
     unsafe { js_remote_keys(keys.as_ptr(), keys.len()) };
-    STARTING.with(|s| s.set(true));
+    CALLS.with(|c| c.borrow_mut().starting = true);
     let started = Runtime::start(root, sets, device, HostMeasure);
-    STARTING.with(|s| s.set(false));
     let Some(mut runtime) = started else {
-        QUEUED.with(|q| q.borrow_mut().clear());
+        CALLS.with(|c| c.borrow_mut().started(false));
         return 0;
     };
     // SAFETY: a host function without arguments.
     runtime.set_wake(std::sync::Arc::new(|| unsafe { js_wake() }));
     RUNTIME.with(|r| *r.borrow_mut() = Some(runtime));
     // The first pump, then what arrived while starting.
+    CALLS.with(|c| c.borrow_mut().started(true));
     run(Box::new(Runtime::pump));
     1
 }
@@ -387,8 +376,9 @@ pub unsafe extern "C" fn nsh_tz_text(
     with_runtime(move |r| r.text(id, &name, text, count));
 }
 
-/// A remote key on view `id` (0: the platform's choice, the focused view or
-/// the newest key listener; the page names only the input it edits):
+/// A remote key on view `id` (0: the platform's choice, the focused view,
+/// an open modal's content or the root; the page names only the input it
+/// edits):
 /// Samsung's `key_code` and the browser's `KeyboardEvent.key` /
 /// `.code` (UTF-8 strings from [`nsh_tz_alloc`]); the app gets the DOM's
 /// name for it ([`crate::keys`]).

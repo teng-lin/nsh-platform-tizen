@@ -1,22 +1,31 @@
 //! Where the remote's keys go, decided here from the tree the engine just
 //! committed rather than on the page, whose copy lags a message behind:
-//! the view the app focused while it is attached, else the topmost
-//! attached modal's root, else the root. A key reported at the root (or a
-//! modal window's root) starts at the view mounted there and bubbles from
-//! it, as NSH's own backends report a key with nothing focused (the
-//! core's `key_start`). OK on a focused view that takes presses presses it
-//! instead of reaching it as a key.
+//! the view the app focused while it is attached; else, with a modal
+//! open, the topmost attached modal's content (its first child that is not
+//! itself a modal, as the core's `key_start` picks a root's content); else
+//! the root, where the core starts the key at the view mounted there. The
+//! core bubbles a key through its logical ancestors up to its window, as on
+//! NSH's own backends: a plain modal is not a window, so its background's
+//! listeners hear what its content does not take (`captureKeys` or a
+//! focus inside the modal keep keys there).
 //!
-//! Each physical key's press decides its route: an auto-repeat and the
-//! release follow it (a release whose view left the tree goes where keys go
-//! now; a release without a press is dropped).
+//! OK on a focused view that takes presses is a key like any other (the
+//! app's `captureKeys` may take it) and, when nothing captured it, presses
+//! the view, as NSH's web backend does.
+//!
+//! Each physical key's press decides its route and its family (a key, or
+//! OK pressing a view): its repeats and release keep the family, and go to
+//! the pressed view, or where keys go now if that view left the tree. A
+//! release without a press is dropped.
 //!
 //! The focus of views (not inputs, whose focus is the page's `<input>`) is
 //! kept here too. `Command::Focus` / `Blur` on a view, an input taking the
 //! focus, and the focused view leaving the tree (detached, or under a
 //! detached ancestor, at the end of a batch) are transitions, each reported
-//! as `Focus` / `Blur` with the focused state after the pump that made it.
-//! A deleted focused view is gone: nothing is reported for it.
+//! as `Focus` / `Blur` with the focused state after the pump that made it,
+//! a Blur always before the Focus that caused it (an input being edited
+//! loses the focus before a view takes it). A deleted focused view is
+//! gone: nothing is reported for it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,8 +36,8 @@ use nsh_core::{Command, EventKind, MountItem, ROOT_ID, ViewKind};
 pub(crate) enum Route {
     /// A key event on this view (bubbling from there).
     Key(u32),
-    /// OK pressed this focused view (`onPress` on the way down, nothing on
-    /// the way up).
+    /// OK on this focused view that takes presses: a key event on it and,
+    /// on the first press when nothing captured the key, `onPress`.
     Press(u32),
     /// Nothing: a release without its press.
     Drop,
@@ -37,13 +46,15 @@ pub(crate) enum Route {
 #[derive(Default)]
 pub(crate) struct Routes {
     parent: HashMap<u32, u32>,
+    /// Each view's children, bottom to top (`Insert`'s `before`).
+    children: HashMap<u32, Vec<u32>>,
     inputs: HashSet<u32>,
     pressable: HashSet<u32>,
-    /// Modal roots, in the order they were last inserted.
-    modals: Vec<u32>,
-    modal_kind: HashSet<u32>,
+    modals: HashSet<u32>,
     /// The focused view (not an input).
     focused: Option<u32>,
+    /// The input being edited (its DOM focus), as the page reported it.
+    pub(crate) editing: Option<u32>,
     /// Focus transitions to report: view, focused.
     pub(crate) transitions: Vec<(u32, bool)>,
     /// Each held key's route, so its repeats and release go where its
@@ -59,28 +70,35 @@ impl Routes {
                     self.inputs.insert(*id);
                 }
                 ViewKind::Modal => {
-                    self.modal_kind.insert(*id);
+                    self.modals.insert(*id);
                 }
                 _ => {}
             },
-            MountItem::Insert { parent, child, .. } => {
+            MountItem::Insert {
+                parent,
+                child,
+                before,
+            } => {
+                self.unlink(*child);
                 self.parent.insert(*child, *parent);
-                if self.modal_kind.contains(child) {
-                    self.modals.retain(|m| m != child);
-                    self.modals.push(*child);
+                let list = self.children.entry(*parent).or_default();
+                match before.and_then(|b| list.iter().position(|c| *c == b)) {
+                    Some(i) => list.insert(i, *child),
+                    None => list.push(*child),
                 }
             }
-            MountItem::Remove { id } => {
-                self.parent.remove(id);
-            }
+            MountItem::Remove { id } => self.unlink(*id),
             MountItem::Delete { id } => {
-                self.parent.remove(id);
+                self.unlink(*id);
+                self.children.remove(id);
                 self.inputs.remove(id);
                 self.pressable.remove(id);
-                self.modal_kind.remove(id);
-                self.modals.retain(|m| m != id);
+                self.modals.remove(id);
                 if self.focused == Some(*id) {
                     self.focused = None;
+                }
+                if self.editing == Some(*id) {
+                    self.editing = None;
                 }
             }
             MountItem::Events { id, events } => {
@@ -104,6 +122,14 @@ impl Routes {
         }
     }
 
+    fn unlink(&mut self, id: u32) {
+        if let Some(p) = self.parent.remove(&id)
+            && let Some(list) = self.children.get_mut(&p)
+        {
+            list.retain(|c| *c != id);
+        }
+    }
+
     /// The end of a batch: a focused view no longer in the tree (it, or an
     /// ancestor, was detached; a move within the batch is not a removal)
     /// loses the focus.
@@ -123,6 +149,11 @@ impl Routes {
             self.transitions.push((old, false));
         }
         if let Some(new) = view {
+            // The input being edited loses the focus first (the page blurs
+            // it; its Blur message is then not reported again).
+            if let Some(input) = self.editing.take() {
+                self.transitions.push((input, false));
+            }
             self.focused = Some(new);
             self.transitions.push((new, true));
         }
@@ -130,8 +161,20 @@ impl Routes {
 
     /// An input took the DOM focus: the focused view loses it (reported
     /// before the input's own Focus).
-    pub(crate) fn input_focused(&mut self) {
+    pub(crate) fn input_focused(&mut self, id: u32) {
         self.focus_view(None);
+        self.editing = Some(id);
+    }
+
+    /// An input lost the DOM focus; false when its Blur was reported
+    /// already (a view took the focus from it).
+    pub(crate) fn input_blurred(&mut self, id: u32) -> bool {
+        if self.editing == Some(id) {
+            self.editing = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether `id` is in the tree under the root.
@@ -149,17 +192,40 @@ impl Routes {
         false
     }
 
+    /// The topmost attached modal: the last in drawing order (children
+    /// bottom to top, depth first).
+    fn top_modal(&self) -> Option<u32> {
+        if self.modals.is_empty() {
+            return None;
+        }
+        let mut top = None;
+        let mut stack = vec![ROOT_ID];
+        while let Some(id) = stack.pop() {
+            if id != ROOT_ID && self.modals.contains(&id) {
+                top = Some(id);
+            }
+            if let Some(children) = self.children.get(&id) {
+                // Visited bottom to top: pushed in reverse.
+                stack.extend(children.iter().rev());
+            }
+        }
+        top
+    }
+
     /// Where a key goes now.
     pub(crate) fn target(&self) -> u32 {
         if let Some(f) = self.focused.filter(|f| self.attached(*f)) {
             return f;
         }
-        self.modals
-            .iter()
-            .rev()
-            .copied()
-            .find(|m| self.attached(*m))
-            .unwrap_or(ROOT_ID)
+        match self.top_modal() {
+            // Its content, as the core's `key_start` takes a root's.
+            Some(m) => self
+                .children
+                .get(&m)
+                .and_then(|c| c.iter().copied().find(|c| !self.modals.contains(c)))
+                .unwrap_or(m),
+            None => ROOT_ID,
+        }
     }
 
     fn fresh(&self, enter: bool, requested: u32) -> Route {
@@ -187,22 +253,23 @@ impl Routes {
     ) -> Route {
         if down {
             let route = match self.held.get(&code) {
-                Some(&held) if repeat => self.still(held, enter, requested),
+                Some(&held) if repeat => self.still(held),
                 _ => self.fresh(enter, requested),
             };
             self.held.insert(code, route);
             return route;
         }
         match self.held.remove(&code) {
-            Some(held) => self.still(held, enter, requested),
+            Some(held) => self.still(held),
             None => Route::Drop,
         }
     }
 
-    /// A held route, or where keys go now if its view left the tree.
-    fn still(&self, held: Route, enter: bool, requested: u32) -> Route {
+    /// A held route, its family kept: to the same view, or where keys go
+    /// now if that view left the tree (a press then no longer presses).
+    fn still(&self, held: Route) -> Route {
         match held {
-            Route::Key(id) | Route::Press(id) if !self.attached(id) => self.fresh(enter, requested),
+            Route::Key(id) | Route::Press(id) if !self.attached(id) => Route::Key(self.target()),
             route => route,
         }
     }
@@ -261,17 +328,52 @@ mod tests {
         assert_eq!(r.transitions, [(4, true)]);
     }
 
+    fn modal(r: &mut Routes, id: u32, parent: u32, before: Option<u32>, content: u32) {
+        r.apply(&MountItem::Create {
+            id,
+            kind: ViewKind::Modal,
+        });
+        r.apply(&MountItem::Insert {
+            parent,
+            child: id,
+            before,
+        });
+        insert(r, id, content);
+    }
+
     #[test]
     fn an_open_modal_takes_keys_without_a_focus() {
         let mut r = tree();
-        r.apply(&MountItem::Create {
-            id: 9,
-            kind: ViewKind::Modal,
-        });
-        insert(&mut r, 1, 9);
-        assert_eq!(r.target(), 9);
+        modal(&mut r, 9, 1, None, 10);
+        assert_eq!(r.target(), 10, "the modal's content");
         r.apply(&MountItem::Remove { id: 9 });
         assert_eq!(r.target(), ROOT_ID);
+    }
+
+    #[test]
+    fn the_topmost_modal_is_the_last_drawn() {
+        let mut r = tree();
+        modal(&mut r, 9, 1, None, 10);
+        // Inserted later but below 9 in drawing order.
+        modal(&mut r, 11, 1, Some(9), 12);
+        assert_eq!(r.target(), 10);
+        // A modal opened from inside another is above it.
+        modal(&mut r, 13, 10, None, 14);
+        assert_eq!(r.target(), 14);
+    }
+
+    #[test]
+    fn an_edited_input_loses_the_focus_before_a_view_takes_it() {
+        let mut r = tree();
+        r.apply(&MountItem::Create {
+            id: 20,
+            kind: ViewKind::Input,
+        });
+        insert(&mut r, 2, 20);
+        r.input_focused(20);
+        focus(&mut r, 4);
+        assert_eq!(r.transitions, [(20, false), (4, true)]);
+        assert!(!r.input_blurred(20), "its Blur was reported already");
     }
 
     #[test]
@@ -340,6 +442,24 @@ mod tests {
         r.apply(&MountItem::Remove { id: 3 });
         r.end_batch();
         assert_eq!(r.route(417, false, false, false, 0), Route::Key(ROOT_ID));
+    }
+
+    #[test]
+    fn a_held_press_keeps_its_family() {
+        let mut r = tree();
+        focus(&mut r, 3);
+        assert_eq!(r.route(13, true, true, false, 0), Route::Press(3));
+        assert_eq!(
+            r.route(13, true, true, true, 0),
+            Route::Press(3),
+            "a repeat is the press's"
+        );
+        // The pressed view goes: the release is a key where keys go now,
+        // never a press of another view.
+        r.apply(&MountItem::Remove { id: 3 });
+        r.end_batch();
+        focus(&mut r, 4);
+        assert_eq!(r.route(13, true, false, false, 0), Route::Key(4));
     }
 
     #[test]

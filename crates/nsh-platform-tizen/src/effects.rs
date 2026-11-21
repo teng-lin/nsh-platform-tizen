@@ -43,7 +43,11 @@ pub(crate) fn write(css: &mut String, s: &ViewStyle) {
             let _ = write!(css, "filter:{};", filters(&effects.filters));
         }
         // Backdrop filters are not drawn: Chromium 69 has no
-        // `backdrop-filter` (the README's "Not done").
+        // `backdrop-filter` (the README's "Not done"); said once.
+        if !effects.backdrop_filters.is_empty() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| log::warn!("not shown on this platform: backdrop-filter"));
+        }
         if !effects.mask_images.is_empty() {
             let images: Vec<String> = effects.mask_images.iter().map(gradient).collect();
             let m = images.join(",");

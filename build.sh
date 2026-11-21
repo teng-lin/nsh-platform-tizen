@@ -7,13 +7,20 @@
 #   NSH_PAGE=page-thread.html  start the page-thread benchmark variant
 #   NSH_OPT=s|z|3              opt-level (default 3)
 #   NSH_FEATURES=...           guide-spike features (ballast)
-#   NSH_FONT=path.ttf          ship a font and register it from the host page
+#   NSH_FONT=path.ttf          ship a font and register it from the host page ("Host Font")
+#   NSH_APP_FONT=path.ttf NSH_APP_FONT_FAMILY=name
+#                              compile a font into the app (feature app-font)
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 nightly="$("$root/../patina-iptv/tools/ci/fuzz-imports.sh" --toolchain)"
+features="${NSH_FEATURES:-}"
+if [[ -n "${NSH_APP_FONT:-}" ]]; then
+    export NSH_APP_FONT NSH_APP_FONT_FAMILY
+    features="${features:+$features,}app-font"
+fi
 RUSTFLAGS="-C target-cpu=mvp -C target-feature=+sign-ext,+mutable-globals" \
     cargo "+$nightly" build -Zbuild-std=std,panic_abort --target wasm32-unknown-unknown \
-    --release -p guide-spike ${NSH_FEATURES:+--features "$NSH_FEATURES"} --target-dir "$root/target/tizen-wasm" \
+    --release -p guide-spike ${features:+--features "$features"} --target-dir "$root/target/tizen-wasm" \
     --config "profile.release.opt-level=${NSH_OPT:-3}"
 stage="$root/target/stage"
 rm -rf "$stage" && mkdir -p "$stage/assets"

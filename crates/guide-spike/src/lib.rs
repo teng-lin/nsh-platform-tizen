@@ -245,6 +245,8 @@ fn header(
                 )
                 .child(
                     text(move || schedule().channel_name(focused.get().0))
+                        // The app's own font (feature `app-font`), else the system's.
+                        .font_family(APP_FONT_FAMILY.unwrap_or("App Font"))
                         .text_size(px(30.0))
                         .text_color(rgb(LIGHT)),
                 )
@@ -325,6 +327,8 @@ fn ruler(focus: Signal<Focus>) -> impl IntoElement {
                 (w.div_euclid(30) + i) * 30
             };
             text(move || clock(at()))
+                // The host page's font (build.sh NSH_FONT), else the system's.
+                .font_family("Host Font")
                 .absolute()
                 .top(px(8.0))
                 .left(move || px(CHANNEL_W + (at() - window.get().0) as f32 * scale()))
@@ -483,7 +487,18 @@ fn ui_sets() -> Vec<nsh_core::element::Registry> {
     Vec::new()
 }
 
-nsh_platform_tizen::app!(ui_sets(), nsh_core::element::Root::of::<Guide>());
+/// The family of the font the app registers itself (feature `app-font`:
+/// build.sh `NSH_APP_FONT`, `NSH_APP_FONT_FAMILY`).
+const APP_FONT_FAMILY: Option<&str> = option_env!("NSH_APP_FONT_FAMILY");
+
+fn root() -> nsh_core::element::Root {
+    let root = nsh_core::element::Root::of::<Guide>();
+    #[cfg(feature = "app-font")]
+    let root = root.font(&include_bytes!(env!("NSH_APP_FONT"))[..]);
+    root
+}
+
+nsh_platform_tizen::app!(ui_sets(), root());
 
 #[cfg(test)]
 mod tests {

@@ -22,3 +22,6 @@ iptv-web = { path = "../../../patina-iptv/crates/iptv-web", optional = true }
 [features]
 ballast = ["ballast-core", "dep:nsh-base"]
 ballast-core = ["dep:iptv-web"]
+# Registers the font file NSH_APP_FONT (family NSH_APP_FONT_FAMILY) with
+# Root::font: the app-font path through the text engine to the page.
+app-font = []

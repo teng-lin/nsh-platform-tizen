@@ -37,6 +37,37 @@
         };
     }
 
+    /*
+     * What a launch's metrics keep in localStorage: the timings and
+     * counts, the first 5 errors, logs and texts of each count list, cut
+     * to 300 characters. An error storm must not write a megabyte every
+     * 2 s.
+     */
+    function saved(M) {
+        var out = {};
+        var cut = function (list) { return (list || []).slice(0, 5).map(function (t) { return String(t).slice(0, 300); }); };
+        var top = function (counts) {
+            var o = {}, keys = Object.keys(counts || {});
+            keys.slice(0, 5).forEach(function (k) { o[k.slice(0, 300)] = counts[k]; });
+            if (keys.length > 5) o['(more)'] = keys.length - 5;
+            return o;
+        };
+        for (var k in M) {
+            if (k === 'errors' || k === 'logs' || k === 'slowOps') out[k] = cut(M[k]);
+            else if (k === 'errorCounts') out[k] = top(M[k]);
+            else if (k === 'keys' || k === 'gaps') out[k] = (M[k] || []).slice(-50);
+            else if (k === 'engine' && M.engine) {
+                var e = {};
+                for (var j in M.engine) e[j] = M.engine[j];
+                e.importErrors = cut(e.importErrors);
+                e.importErrorCounts = top(e.importErrorCounts);
+                e.logs = cut(e.logs);
+                out.engine = e;
+            } else out[k] = M[k];
+        }
+        return out;
+    }
+
     function absolute(url) { return new URL(url, location.href).href; }
 
     var current = null;      /* the running session */
@@ -94,7 +125,7 @@
         try {
             var all = JSON.parse(localStorage.getItem('nsh.metrics') || '[]');
             if (all.length && all[all.length - 1].at === M.at) all.pop();
-            all.push(M);
+            all.push(saved(M));
             localStorage.setItem('nsh.metrics', JSON.stringify(all.slice(-5)));
         } catch (e) { /* optional */ }
     };
@@ -156,7 +187,15 @@
         if (this.engine) this.engine.halt();
         if (this.worker) this.worker.terminate();
         this.renderer.haltComponents();
-        this.error(text);
+        /* Its own one-shot path: told to the host and saved even when
+         * the error list is full. */
+        text = String(text);
+        this.M.fatal = text.slice(0, 2000);
+        if (typeof console !== 'undefined') console.error(text);
+        this.note(text);
+        if (this.options.onError) {
+            try { this.options.onError(text); } catch (e) { this.note('onError threw: ' + String(e && e.stack || e)); }
+        }
         this.saveNow();
     };
 

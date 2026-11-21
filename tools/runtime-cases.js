@@ -480,6 +480,93 @@
         });
     });
 
+    withFakeAsync(function (f, r, events) {
+        /* Hidden and shown again before the app's seek answers: reopened
+         * where the player was once the seek ended, not at 0. */
+        var hidden = false;
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hidden; } });
+        var restore = function () { delete document.hidden; };
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 16 } }, []]]);
+        f.prepared.ok();
+        f.seekHangs = true;
+        r.apply([['np', 50, { seek: { token: 16, id: 1, ms: 9000 } }, []]]);
+        hidden = true;
+        document.dispatchEvent(new Event('visibilitychange'));
+        hidden = false;
+        document.dispatchEvent(new Event('visibilitychange'));
+        f.seekHangs = false;
+        f.time = 9000;
+        f.calls = [];
+        f.hanging.ok();
+        return wait(20).then(function () {
+            f.prepared.ok();
+            return wait(60);
+        }).then(function () {
+            restore();
+            var seeks = f.calls.filter(function (c) { return c.indexOf('seekTo') === 0; });
+            check(seeks.join(',') === 'seekTo 9000', 'a quick hide and show reopens at the position after the seek: ' + f.calls.join(','));
+            check(f.misuse.length === 0, 'no refused call: ' + f.misuse.join(','));
+        }, function (e) { restore(); throw e; });
+    });
+
+    withFakeAsync(function (f, r, events, sent) {
+        /* A STUCK player whose retries are spent: a later open restarts
+         * the retries (one loop) and opens once the close succeeds; with a
+         * player that never closes it is told busy. */
+        NshTizen.avplay.stuckRetryMs = 10;
+        NshTizen.avplay.stuckTries = 2;
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 17 } }, []]]);
+        f.prepared.ok();
+        f.closeFails = 100;
+        r.apply([['np', 50, { source: null }, []]]);
+        return wait(80).then(function () {
+            /* Still refusing when the new open comes: it waits, and the
+             * restarted retries let it open once the close goes through. */
+            f.calls = [];
+            var sent2 = [];
+            var r2 = renderer(sent2);
+            r2.apply(mount.concat([['n', 50, 'test.avplay'], ['np', 50, { source: { url: 'https://x.test/b.m3u8', token: 1 } }, []]]));
+            return wait(5).then(function () {
+                f.closeFails = 0;
+                return wait(80);
+            }).then(function () {
+                check(f.calls.indexOf('open') >= 0, 'after the spent retries a new open restarts them and opens: ' + f.calls.join(','));
+                r2.dispose();
+                /* A player another page holds: busy at once, not silence. */
+                f.state = 'PLAYING';
+                var sent3 = [];
+                var r3 = renderer(sent3);
+                r3.apply(mount.concat([['n', 50, 'test.avplay'], ['np', 50, { source: { url: 'https://x.test/c.m3u8', token: 1 } }, []]]));
+                check(sent3.some(function (m) { return m.t === 'native' && m.data.indexOf('busy') >= 0; }), 'a player that stays taken is reported busy');
+                r3.dispose();
+                NshTizen.avplay.stuckRetryMs = 1000;
+                NshTizen.avplay.stuckTries = 10;
+            });
+        });
+    });
+
+    /* An app OK whose press focused an input: its repeats reach the page's
+     * handler (still the app's), and its release is sent. */
+    later.push(function () {
+        var sentIn = [];
+        var r = renderer(sentIn);
+        r.apply([['c', 71, 'input'], ['i', 1, 71, null], ['in', 71, { css: '', ph: '', type: 'text', ml: false, max: -1, off: false, submit: 'blur', auto: false }]]);
+        r.keys[13] = 'app';
+        var el = r.nodes[71].input.el;
+        el.focus();
+        var reached = false;
+        var spy = function () { reached = true; };
+        document.addEventListener('keydown', spy);
+        var e = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, repeat: true });
+        Object.defineProperty(e, 'keyCode', { get: function () { return 13; } });
+        el.dispatchEvent(e);
+        document.removeEventListener('keydown', spy);
+        check(reached, 'the repeat reaches the page\'s handler');
+        check(!sentIn.some(function (m) { return m.name === 'onSubmitEditing'; }), 'and the input does not take it as a submit');
+        r.dispose();
+        return Promise.resolve();
+    });
+
     /* A held OK that focused an input stays the app's: its repeats in the
      * input do not turn it into a swallowed key, so its release is sent. */
     later.push(function () {

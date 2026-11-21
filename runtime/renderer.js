@@ -461,6 +461,10 @@ var NshTizen = (function () {
             if (!self.live(n) || n.input !== input) return;
             var submit = input.config.submit || 'blur';
             var code = e.keyCode;
+            /* A repeat of a key pressed before this input took the focus
+             * (an OK that focused it) is still that press's: the page's
+             * handler takes it. */
+            if (e.repeat && self.keys[code] && self.keys[code] !== 'swallowed') return;
             /* Enter, or the TV keyboard's Done; held, it submits once. */
             if ((code === 13 || code === IME_DONE) && !(submit === 'newline' && code === 13)) {
                 e.preventDefault();

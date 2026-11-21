@@ -17,8 +17,10 @@
  *   firstRender {token}: the first playing time after opening (AVPlay
  *               reports no frame presentation; this is the nearest)
  *   position    {ms}: about once a second
- *   timeline    {token, seekId, ms, durationMs, seekable, failed?}: after
- *               a seek; `failed: true` when it did not happen
+ *   timeline    {token, seekId, ms, durationMs, seekable, failed?, stale?}:
+ *               after a seek; `failed: true` when it did not happen,
+ *               `stale: true` when the duration is the last known one (the
+ *               player was closed, or the answer came from the watchdog)
  *   error       {code}: AVPlay's error name; the player is closed after it
  * Not supported by AVPlay here (ignored): headers, volume, muted, tracks.
  *
@@ -45,8 +47,10 @@
  * position kept; it reopens there when the page shows again, and the
  * app's last completed seek is not replayed.
  *
- * `NshTizen.avplay.api` is the player it drives (webapis.avplay) and
- * `NshTizen.avplay.seekTimeoutMs` the watchdog; tests replace them.
+ * Settings tests replace: `NshTizen.avplay.api` (the player it drives,
+ * webapis.avplay), `seekTimeoutMs` (the watchdog, 5 s), `seekGiveUpMs`
+ * (when waiting calls run anyway, 30 s), `stuckRetryMs` and `stuckTries`
+ * (the STUCK close retries, every second, ten times).
  * Plain ES2017 (Chromium 69).
  */
 'use strict';
@@ -59,33 +63,57 @@ NshTizen.avplay = (function () {
     var seekInFlight = null;
     var afterSeek = [];
     /* Opens that found AVPlay STUCK (by one of ours): tried again once a
-     * close succeeds. */
+     * close succeeds, or told busy once the retries are spent. One retry
+     * loop runs at a time. */
     var stuckWaiters = [];
     var stuckTries = 0;
+    var stuckLoop = false;
+
+    /* AVPlay is ours no more: STUCK cleared (wherever that happened), the
+     * waiting opens run. */
+    function unstuck() {
+        owner = null;
+        stuckTries = 0;
+        drainStuck();
+    }
+
+    function drainStuck() {
+        var waiting = stuckWaiters;
+        stuckWaiters = [];
+        waiting.forEach(function (f) { setTimeout(f, 0); });
+    }
+
+    /* Starts the retry loop if none runs (with a fresh budget). */
+    function startStuckRetry() {
+        if (stuckLoop) return;
+        stuckLoop = true;
+        stuckTries = 0;
+        setTimeout(retryStuck, factory.stuckRetryMs);
+    }
 
     /* Retries the close of a STUCK player, a few times, then lets the
      * waiting opens report busy. */
     function retryStuck() {
-        if (owner !== STUCK) return;
+        if (owner !== STUCK) { stuckLoop = false; drainStuck(); return; }
         whenIdle(function () {
-            if (owner !== STUCK) return;
+            if (owner !== STUCK) { stuckLoop = false; drainStuck(); return; }
             var p = factory.api();
             try { p.close(); } catch (e) { /* still refused */ }
             if (state(p) === 'NONE') {
-                owner = null;
-                stuckTries = 0;
+                stuckLoop = false;
+                unstuck();
             } else if (++stuckTries < factory.stuckTries) {
                 setTimeout(retryStuck, factory.stuckRetryMs);
-                return;
+            } else {
+                stuckLoop = false;
+                drainStuck();
             }
-            var waiting = stuckWaiters;
-            stuckWaiters = [];
-            waiting.forEach(function (f) { f(); });
         });
     }
 
+    /* AVPlay's state; 'UNKNOWN' when it cannot say (then it is not free). */
     function state(p) {
-        try { return p.getState(); } catch (e) { return 'NONE'; }
+        try { return p.getState(); } catch (e) { return 'UNKNOWN'; }
     }
 
     /* Runs `f` now, or when the running seek ends (whatever instance or
@@ -101,7 +129,7 @@ NshTizen.avplay = (function () {
         if (owner === STUCK) {
             try { p.close(); } catch (e) { /* still stuck? */ }
             if (state(p) !== 'NONE') return false;
-            owner = null;
+            unstuck();
         }
         return !owner && state(p) === 'NONE';
     }
@@ -114,6 +142,7 @@ NshTizen.avplay = (function () {
         var prepared = false;
         var started = false;  /* it played since it was prepared */
         var sizeSent = false, rendered = false, lastPosition = -1e9;
+        var lastDuration = 0;  /* the source's duration, as last read */
         var doneSeek = null;  /* the app's last completed seek {token, id} */
         var pendingSeek = null;
         var hidden = null;    /* {source, ms}: closed while the page is hidden */
@@ -132,8 +161,8 @@ NshTizen.avplay = (function () {
                     try { p.stop(); } catch (e) { /* idle */ }
                     try { p.close(); } catch (e) { closed = state(p) === 'NONE'; }
                 }
-                owner = closed ? null : STUCK;
-                if (!closed) { stuckTries = 0; setTimeout(retryStuck, factory.stuckRetryMs); }
+                if (closed) owner = null;
+                else { owner = STUCK; startStuckRetry(); }
             });
         }
 
@@ -232,14 +261,20 @@ NshTizen.avplay = (function () {
                 if (my !== token || gone) return;
                 /* Hidden meanwhile (a zap queued behind a seek, then a
                  * hide): opened when the page shows again. */
-                if (document.hidden) { hidden = { source: source, ms: startMs }; return; }
+                var ms = typeof startMs === 'function' ? startMs() : startMs;
+                if (document.hidden) { hidden = { source: source, ms: ms }; return; }
                 if (!available(p, ctx)) {
                     /* Our own stuck player: tried again once it closes. */
-                    if (owner === STUCK && !tried) { stuckWaiters.push(retry); return; }
+                    if (owner === STUCK && !tried) {
+                        /* A loop that spent its budget is started again. */
+                        stuckWaiters.push(retry);
+                        startStuckRetry();
+                        return;
+                    }
                     emit('error', { code: 'busy' });
                     return;
                 }
-                openNow(p, source, startMs, my);
+                openNow(p, source, ms, my);
             };
             var tried = false;
             var retry = function () { if (tried) { emit('error', { code: 'busy' }); return; } tried = true; attempt(); };
@@ -249,7 +284,10 @@ NshTizen.avplay = (function () {
         function openNow(p, source, startMs, my) {
             sizeSent = false; rendered = false; lastPosition = -1e9;
             /* The same source reopened keeps its completed seek. */
-            if (!(doneSeek && doneSeek.token === source.token)) doneSeek = null;
+            if (!(doneSeek && doneSeek.token === source.token)) {
+                doneSeek = null;
+                lastDuration = 0;
+            }
             pendingSeek = props.seek || null;
             var live = function () { return my === token && owner === ctx; };
             try {
@@ -346,11 +384,14 @@ NshTizen.avplay = (function () {
                  * now (a hide closed it meanwhile): not asked again. */
                 if (!props.source || props.source.token !== s.token) return;
                 doneSeek = { token: s.token, id: s.id };
-                var duration = 0;
-                if (ok && current && !seekInFlight) {
-                    try { duration = p.getDuration(); } catch (e) { /* live */ }
+                /* The duration now when the player can say (open, no seek
+                 * running), else the last known one, marked stale. */
+                var fresh = ok && current && !seekInFlight && owner === ctx;
+                if (fresh) {
+                    try { lastDuration = p.getDuration(); } catch (e) { /* live */ }
                 }
-                var timeline = { token: s.token, seekId: s.id, ms: s.ms, durationMs: duration, seekable: duration > 0 };
+                var timeline = { token: s.token, seekId: s.id, ms: s.ms, durationMs: lastDuration, seekable: lastDuration > 0 };
+                if (!fresh) timeline.stale = true;
                 if (!ok) timeline.failed = true;
                 emit('timeline', timeline);
             });
@@ -372,7 +413,9 @@ NshTizen.avplay = (function () {
             } else if (hidden) {
                 var h = hidden;
                 hidden = null;
-                if (same(h.source, props.source)) open(h.source, h.ms);
+                /* The position as read when the queued close ran (a show
+                 * before the seek's callback still opens there). */
+                if (same(h.source, props.source)) open(h.source, function () { return h.ms; });
                 else if (props.source && props.source.url) open(props.source, 0);
             }
         }

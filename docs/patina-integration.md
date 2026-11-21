@@ -19,8 +19,17 @@ is either NSH's own or one the host chooses.
 - `runtime/bundle.sh DIR` writes the page scripts (`nsh-tizen.js`,
   `nsh-worker.js`, `nsh-engine.js`). The package needs these, the module
   (`app.wasm`), the host's page and scripts, and `assets/` for `asset:/` images.
-- `config.xml` privileges: `internet`, `tv.inputdevice`. If it declares a CSP,
-  it needs `object-src 'self'` for AVPlay and `worker-src`/`script-src 'self'`.
+- Pass the module's SHA-256 as `version` (build.sh writes it into
+  `app-config.js`): it keys the compiled-module cache, so an update never
+  runs the old compiled code.
+- `config.xml` privileges: `internet`, `tv.inputdevice`. A declared CSP
+  switches Tizen from WARP to CSP mode. The one that works on the TV
+  (the example app's): `default-src 'self'; script-src 'self' 'unsafe-eval';
+  style-src 'self' 'unsafe-inline'; img-src * blob: data:; font-src 'self'
+  blob: data:; media-src *; connect-src *; object-src 'self'; worker-src
+  'self' blob:`. The renderer needs inline styles, `blob:` images and fonts;
+  AVPlay needs `object-src`. Keep every script in a file: the policy allows
+  no inline script.
 
 ## The host page
 
@@ -29,6 +38,7 @@ is either NSH's own or one the host chooses.
 <object type="application/avplayer" style="position:absolute;left:0;top:0;width:1920px;height:1080px"></object>
 <div id="app"></div>
 <script src="nsh-tizen.js"></script>
+<script src="app-config.js"></script>   <!-- window.NSH_MODULE_VERSION -->
 <script src="patina-host.js"></script>
 ```
 
@@ -39,6 +49,7 @@ NshTizen.registerComponent('tv.player', PatinaPlayer);   // or NshTizen.avplay t
 NshTizen.start({
     container: document.getElementById('app'),
     module: 'app.wasm',
+    version: window.NSH_MODULE_VERSION,
     worker: 'nsh-worker.js',
     scripts: ['patina-worker.js'],         // host services, run in the Worker
     fonts: [],                             // optional: [{ family, url, weight, style }]
@@ -53,11 +64,14 @@ NshTizen.start({
 `native("tv.player")` mounts the component the host registered under that
 name. The platform passes the wire contract through unchanged:
 
-- `props(changed, all)`: the contract's props under their wire names, as
-  JSON (`source` `{url, headers, token, live, reconnect}` or `null`,
-  `paused`, `seek`, `pictureSize`, `videoTrack`, `audioTrack`, `textTrack`,
-  `volume`, `muted`, `audioDelay`, `pip`). `changed` holds only what changed
-  in this commit; a removed prop is absent from `all`.
+- `props(changed, all, removed)`: the contract's props under their wire
+  names, as JSON (`source` `{url, headers, token, live, reconnect}` or
+  `null`, `paused`, `seek`, `pictureSize`, `videoTrack`, `audioTrack`,
+  `textTrack`, `volume`, `muted`, `audioDelay`, `pip`). `changed` holds only
+  what changed in this commit; a prop set to `null` is in it as `null`, a
+  removed prop is named in `removed` and absent from `all`.
+- A component's methods are isolated: a throw is reported in
+  `__nsh.errors`, the page goes on, and `destroy` still removes the view.
 - `frame(rect)`: the view's rect on the 1920 × 1080 page whenever it moves
   (`visible: false` when it is detached or empty). AVPlay's
   `setDisplayRect` takes these coordinates.
@@ -95,7 +109,15 @@ NshTizenWorker.onInstance(function (exports, engine) {
   0. They are listed in `window.__nsh.engine.stubbed`, so a missing host
   service shows up there instead of as a link error.
 - After an async host callback calls into the module, call `engine.pump()`.
-  It runs the engine and sends what it committed to the page.
+  It runs the engine and sends what it committed to the page. Tasks the
+  callback woke are pumped through the engine's wake as well.
+- **Re-entry rule:** an import may call into the module (an export, or
+  `engine.pump()`) while the module runs. The call is queued and runs when
+  the outer call ends, never re-entering the runtime. Don't rely on its
+  effect being visible before your import returns.
+- Every import is wrapped: a throw is reported (`__nsh.engine.importErrors`)
+  and returns 0 to the module. A trap in the module (a panic) stops the
+  engine for good, and `onError` gets its stack.
 - Storage: the Worker has IndexedDB but not `localStorage`. The platform
   provides no NSH storage service (`EngineConfig::storage`). Patina's own
   persistence (the chunked SQLite VFS) runs through its imports.
@@ -106,8 +128,10 @@ NshTizenWorker.onInstance(function (exports, engine) {
 ## Remote keys
 
 Keys arrive as NSH `KeyEvent`s on the view the app focused
-(`ElementRef::focus` on a `focusable` view), else on the newest view
-listening for keys, and bubble from there. `key` carries the UI Events
+(`ElementRef::focus` on a `focusable` view) while it is attached, else on
+the newest attached view listening for keys, and bubble from there. The
+engine decides this from its own tree, so OK right after a move goes to the
+new focus; a release goes where its press went. `key` carries the UI Events
 name (`keys.rs`). `code` carries the browser's `KeyboardEvent.code`, which
 is often empty for remote keys.
 

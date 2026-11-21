@@ -57,6 +57,7 @@ NshTizen.registerComponent('tv.player', NshTizen.avplay);  // name → factory
 NshTizen.start({
     container: document.getElementById('app'),
     module: 'app.wasm',                // the app's module (built as below)
+    version: '…',                      // the module's SHA-256: the compiled-module cache key
     worker: 'nsh-worker.js',
     scripts: [],                       // Worker scripts with host imports
     fonts: [],                         // [{ family, url, weight, style }]
@@ -64,17 +65,25 @@ NshTizen.start({
     backDebounceMs: 600,               // Back presses closer than this are one
     onHost: function (message) {},     // nsh_platform_tizen::host(json) from the app
     onExit: function () {},            // Command::ExitApp (default: the app exits)
-    onError: function (text) {}
+    onError: function (text) {}        // errors, a Worker that failed, an app that stopped
 });
+NshTizen.stop();                       // ends the session (a second start does too)
 ```
+
+Each `start` is a session: a second one ends the first, with its Worker,
+DOM, listeners and callbacks. Every host callback (`onHost`, `onError`,
+components) is isolated: a throw is reported in `__nsh.errors` and does not
+stop the page. Inline scripts are avoided (the example app declares a CSP,
+below); `build.sh` writes the module's version into `app-config.js`.
 
 **Native components.** `native("name")` in the app mounts the factory
 registered under `name`. It gets `ctx`: `id`, `name`, `element` (the
 container `<div>`), `emit(event, data)` (to `on_native_event`) and `rect()`.
 It returns any of these methods:
 
-- `props(changed, all)`: JSON props by name, after every commit that
-  changes them.
+- `props(changed, all, removed)`: JSON props by name, after every commit
+  that changes them. A prop set to `null` is in `changed` as `null`; a prop
+  removed is named in `removed` and absent from `all`.
 - `frame(rect)`: `{x, y, width, height, visible}` on the page, whenever it
   moves. It sums the frames and subtracts scroll offsets, and reads no
   layout from the DOM.
@@ -99,9 +108,20 @@ tracks.
 app's imports for them run in the Worker: a script in `options.scripts`
 calls `NshTizenWorker.addImports(module, functions)` and
 `NshTizenWorker.onInstance(function (exports, engine) {...})`. After an
-async reply, the script calls `engine.pump()`. Imports nobody provides
-become no-ops, listed in `__nsh.engine.stubbed`. The platform provides no
-NSH `storage`, `network` or `assets` service.
+async reply, the script calls `engine.pump()`; tasks the reply woke are
+also pumped through the engine's wake (`LocalEngine::set_wake`). Imports
+nobody provides become no-ops, listed in `__nsh.engine.stubbed`.
+
+Failures are contained. An import that throws (the platform's or a host's)
+is caught, reported, and returns 0, never unwinding through the module. An
+import that calls back into the module during a pump is queued and runs
+when the outer call ends. A trap in the module (a Rust panic aborts) stops
+the engine: one error with its stack, and nothing calls into it again. A
+cached module that no longer links is evicted and compiled again once. The
+platform provides no NSH `storage`, `network` or `assets` service.
+Clipboard reads, `OpenUrl` and `PickScreenColor` are answered at once
+(nothing on the clipboard, not opened, none picked), so an app awaiting
+one goes on.
 
 **Fonts.** The app registers fonts with `Root::font` or `register_font`:
 the text engine reads the file's family, weight and style, and the Worker
@@ -113,11 +133,20 @@ resolves every family name, `serif` and `monospace` included, to one font.
 **Keys.** The remote's keys arrive as NSH `KeyEvent`s with UI Events names
 (`keys.rs`: `GoBack` 10009, `ColorF0Red`…`ColorF3Blue` 403–406,
 `ChannelUp`/`ChannelDown` 427/428, `MediaPlayPause` 10252, the other media
-keys, `Info`, `Guide`, `ChannelList`, `MediaLast`, digits). A key goes to
-the input being edited, else to the view the app focused
-(`ElementRef::focus` on a focusable view), else to the newest view listening
-for keys. The core bubbles it from there. OK on a focused view that takes
-presses presses it.
+keys, `Info`, `Guide`, `ChannelList`, `MediaLast`, digits). The engine
+decides where a key goes, from the tree it just committed (the page's copy
+lags a message behind): the view the app focused (`ElementRef::focus` on a
+focusable view) while it is attached, else the newest attached view
+listening for keys, else the root. The page names only the input being
+edited. The core bubbles the key from there. OK on a focused view that takes
+presses presses it, without also arriving as a key. A key's release goes
+where its press went. The engine also reports the views' own `Focus` and
+`Blur`; an input taking the DOM focus takes it from the focused view, and a
+view taking the focus closes the TV keyboard.
+
+Keys an input handled (Done, Cancel, Enter for a submit), Back while
+editing (it leaves the input), and a Back within `backDebounceMs` of the
+last are dropped on the way down and on the way up.
 
 At start the page registers the table's keys one at a time with
 `tvinputdevice.registerKey`, and again when it becomes visible. Exit,
@@ -128,7 +157,9 @@ Worker, so it prevents the default of every key in the table.
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV
 keyboard. It handles value (dropped if the user typed since), placeholder
 and its color, type (`password`, `number`, `email`, `tel`, `url`), max
-length, read only and auto focus. Focus and blur commands, change and submit
+length, read only and auto focus. A masked input is always one line (a
+`<textarea>` cannot hide its text). Changing `multiline` while typing keeps
+the text, the focus and the selection. Focus and blur commands, change and submit
 events, and Focus/Blur all work. Done (65376) submits, and blurs unless the
 input keeps focus. Cancel (65385) and Back leave the input. While an input
 is edited, the arrows, OK and digits belong to the keyboard.
@@ -136,8 +167,11 @@ is edited, the arrows, OK and digits belong to the keyboard.
 **Images.** `<img>` with `object-fit`, `object-position`, blur, a
 placeholder, the `onLoad`/`onError`/`onLoadStart`/`onLoadEnd` events, and
 `asset:/x` served from the package's `assets/`. In-memory images (`data:`)
-come as bytes and are shown through blob URLs. `svg()` with a text color is
-drawn as a mask of that color.
+come as bytes, placeholders included, and are shown through blob URLs of
+their type; a blob is released when no view shows it. `svg()` with a text
+color is drawn as a mask of that color. URIs are escaped in CSS, and an
+`<img>` loads only `http(s)`, `blob`, `data:image`, the package's files and
+relative URLs.
 
 **Diagnostics.**
 
@@ -145,16 +179,30 @@ drawn as a mask of that color.
   logs and errors. `__nsh.engine` holds module size, compile, cache, start
   and stubbed imports.
 - `localStorage['nsh.metrics']` keeps the last five launches.
-- `localStorage['nsh.autobench'] = '1'` runs the benchmark on the next
+- `NshTizen.record()` keeps the next 50 batches (`NshTizen.recorded()`).
+- Benchmark builds only (`NSH_BENCH=1`, which adds `nsh-bench.js`):
+  `localStorage['nsh.autobench'] = '1'` runs the benchmark on the next
   launch, with results in `nsh.bench`.
+
+**CSP.** The example app declares one in `config.xml`, which moves Tizen
+from WARP to CSP mode: `default-src 'self'; script-src 'self'
+'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src * blob: data:;
+font-src 'self' blob: data:; media-src *; connect-src *; object-src 'self';
+worker-src 'self' blob:`. The renderer needs inline styles (its `<style>`
+elements), `blob:` images and fonts, and `object-src` for AVPlay. Chromium
+69 has no `'wasm-unsafe-eval'`, so `'unsafe-eval'` allows the page-thread
+variant to compile. It runs on the TV with this policy, Worker and AVPlay
+included.
 
 ## Build and test
 
 ```sh
 TIZEN_SIGNING_PROFILE=<profile> ./build.sh [--install <tv-ip>:26101]
 #   NSH_PAGE=page-thread.html  the page-thread benchmark variant
+#   NSH_BENCH=1                include the shared benchmark (tools/tv.sh bench needs it)
 #   NSH_OPT=s|z|3  NSH_FEATURES=ballast  NSH_FONT=x.ttf  NSH_APP_FONT=x.ttf NSH_APP_FONT_FAMILY=name
-cargo test                               # encoding, keys, fonts, components, inputs, images
+cargo test                               # encoding, keys, routing, fonts, components, inputs, images
+(cd tools && npm ci)                     # acorn, for the ES2017 check (tools only)
 node tools/page-test.mjs                 # the built package in headless Chromium (after build.sh)
 tools/tv.sh install|debug|eval|bench     # on the TV (TV=host:port, APP=id)
 ```
@@ -229,10 +277,11 @@ Worker's per-key cost stays in the engine; the renderer halved its share.
 | `<script type="module">` and streaming compilation fail (package files have no MIME type) | Avoided: classic scripts, XHR, `WebAssembly.compile` from bytes. Not tested. |
 | Workers resolve relative URLs wrongly | Avoided: every Worker URL is absolute. Not tested. |
 | An opaque background hides AVPlay's video | Followed: transparent down to `body`, the `<object>` first in `body`. The picture couldn't be checked (no screenshots); the player reached `ready` with its size. |
-| AVPlay call order, close after errors, tokens, stop while hidden | Implemented. Open, prepare, play, pause and zap worked. The error and hidden paths weren't exercised. |
+| AVPlay call order, close after errors, tokens, stop while hidden | Implemented. On the TV: open, prepare, play, pause and zap. Against a fake AVPlay in headless Chromium (`tools/runtime-cases.js`): the call order, late callbacks of a replaced stream dropped, a throwing `play()` and an error both closing and releasing the player, a seek before ready deferred. The hidden path wasn't exercised on the TV (`tizen run` relaunched the app). |
 | Register keys one by one, again when visible; not Exit or Volume | Implemented. The registration worked; re-registration wasn't exercised. |
 | Back debounce (about 600 ms) | Implemented (`backDebounceMs`). Not exercised with a real remote. |
-| IME Done/Cancel are 65376 / 65385; blur when focus leaves | Done verified with a synthetic key; Back blurs. |
+| IME Done/Cancel are 65376 / 65385; blur when focus leaves | On the TV, with synthetic keys: Done submits without the app also seeing it, Back blurs without reaching the app. |
+| Declaring a CSP switches Tizen to CSP mode | The example app declares one; the Worker, wasm compile, styles, images and AVPlay all work under it on the TV. |
 | About 120 MB JS heap budget | The page uses 10 MB (the Worker's heap isn't measured). |
 
 Found here: the first access to `webapis.avplay` costs the page about

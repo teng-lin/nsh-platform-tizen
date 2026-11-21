@@ -1,10 +1,16 @@
 //! The text engine: NSH lays text out once, on the engine's side
 //! (`TextEngine`: prepare, measure at any width, lay out at the final
-//! size), and the Mini Program only draws the lines it is given. Widths come
-//! from the host ([`Measure`]: the logic layer's `OffscreenCanvas`
-//! `measureText`); lines break greedily at spaces and between CJK
-//! characters, so each line is placed where the engine measured it and the
-//! render layer never wraps text itself (`white-space: pre`).
+//! size), and the page only draws the runs it is given. Widths come from
+//! the host ([`Measure`]: the Worker's `OffscreenCanvas` `measureText`);
+//! lines break greedily at spaces and between CJK characters, so each run
+//! is placed where the engine measured it and the page never wraps text
+//! itself (`white-space: pre`).
+//!
+//! Fonts: an app's registered fonts (`Root::font`, `register_font`) reach
+//! the host through [`Measure::register_font`] (a `FontFace` in the Worker,
+//! for measuring, and in the page, for drawing). Without one, text is in
+//! the TV's system font, which every family name resolves to on a 2020
+//! set.
 //!
 //! Each span keeps its own style: a line is runs of one style each,
 //! measured in their font and placed on the line's shared baseline, and an
@@ -24,6 +30,14 @@ use crate::encode::color;
 pub trait Measure {
     /// The advance width of `text` in `font` (a CSS `font` shorthand).
     fn width(&self, font: &str, text: &str) -> f32;
+
+    /// Makes the font file `data` usable as `face`, for measuring and
+    /// drawing; widths measured before it loaded are stale once it has
+    /// (the host calls `fonts_changed` then).
+    fn register_font(&self, face: &crate::font::Face, data: &[u8]) -> Result<(), String> {
+        let _ = (face, data);
+        Err("this host cannot register fonts".to_owned())
+    }
 }
 
 /// A deterministic [`Measure`] for tests and hosts without fonts: every
@@ -284,12 +298,11 @@ impl<M: Measure> TizenTextEngine<M> {
     }
 }
 
-/// The family texts without one of their own are measured and drawn in,
-/// named rather than `sans-serif`: the logic layer's canvas and the render
-/// layer resolve `sans-serif` to different fonts (Helvetica and PingFang SC
-/// in WeChat DevTools on a Mac), so lines measured in one would not fit in
-/// the other. WeChat's own on iOS first, then the common system fonts.
-const DEFAULT_FAMILY: &str = "'PingFang SC','Helvetica Neue',Helvetica,Arial,sans-serif";
+/// The family texts without one of their own are measured and drawn in.
+/// Samsung's names first: a 2020 set resolves every family to its one
+/// system font, and the Worker's canvas and the page then agree; newer sets
+/// may have more.
+const DEFAULT_FAMILY: &str = "SamsungOne,'Tizen Sans',sans-serif";
 
 /// The CSS family list of a text in `name` (the default's without one).
 fn family(name: Option<&str>) -> String {
@@ -504,6 +517,11 @@ impl<M: Measure> TextEngine for TizenTextEngine<M> {
             Some(size.width.0),
             size.width.0,
         )))
+    }
+
+    fn register_font(&self, data: &[u8]) -> Result<(), String> {
+        let face = crate::font::parse(data)?;
+        self.measure.register_font(&face, data)
     }
 
     fn attachments(&self, layout: &TextLayout) -> Vec<Option<Point<Points>>> {

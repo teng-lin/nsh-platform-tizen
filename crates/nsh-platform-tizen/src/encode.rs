@@ -1,26 +1,37 @@
-//! The batches the engine commits, as the operations the Mini Program's
-//! runtime applies (`runtime/nsh-tz.js`): one JSON array per commit, each
+//! The batches the engine commits, as the operations the page runtime
+//! applies (`runtime/renderer.js`): one JSON array per commit, each
 //! operation an array led by its code. Everything here is plain Rust over
 //! NSH's mount items, so it is tested on the host.
 //!
 //! | Op | Fields | Meaning |
 //! |---|---|---|
-//! | `c` | id, kind | create a view (`view`, `text`, `scroll`, `image`, `canvas`, `stack`, `screen`, `modal`) |
+//! | `c` | id, kind | create a view (`view`, `text`, `scroll`, `image`, `input`, `native`, ...) |
 //! | `i` | parent, child, before | insert `child` below sibling `before` (`null`: on top) |
 //! | `r` | id | detach a view, keeping it |
 //! | `d` | id | destroy a view |
 //! | `f` | id, x, y, width, height | the frame, in the parent (px) |
 //! | `s` | id, css | the view's decoration as inline CSS |
-//! | `t` | id, text | the lines of a text: `{ font, color, lineHeight, x, y, lines: [[text, x, y]] }` |
+//! | `a` | id, css | animated properties ([`crate::anim`]), after the decoration |
+//! | `t` | id, text | a text's runs: `{ x, y, styles: [css], runs: [[text, x, y, lineHeight, style]] }` |
 //! | `e` | id, events | the events it reports ([`events`]: bits) |
+//! | `ts` | id, states | the interaction states it reports (`tailwind::state` bits) |
+//! | `vp` | id, focusable, testId | `focusable` (`true`, `false`, `null`) and the test id |
 //! | `sc` | id, horizontal | a scroll view's axis |
 //! | `ss` | id, width, height | a scroll view's content size |
-//! | `im` | id, src, mode | an image's source (`null`: none) and WeChat `mode` |
+//! | `sb` / `st` | id, dx, dy / id, x, y, animated | scroll by / to |
+//! | `im` | id, src, fit, placeholder, blur, position, tint | an image: `src` (`null`: none), CSS `object-fit`, placeholder `src`, blur px, CSS `object-position`, and for an `svg()` the color its `currentColor` paints (drawn as a mask of that color; `null` otherwise) |
+//! | `in` | id, config | an input's configuration ([`input`]) |
+//! | `iv` | id, text, count | an input's text, set by the app after the user's `count`th edit |
+//! | `ic` | id, x, y, width, height | where an input's text goes |
+//! | `fo` | id, focus | focus (`true`) or blur an input or a focusable view |
+//! | `n` | id, name | create the registered native component `name` in a `native` view |
+//! | `np` | id, props | its changed props: `{ name: value }`, `null` removes one |
+//! | `nc` | id, name, args | a command to it (`ElementRef::command`) |
 //! | `cv` | id, ops | what a canvas draws ([`crate::canvas`]) |
-//! | `scr` | id, config | a screen's `{ title, header, preventBack }`: each screen pushed over a stack's first is a page of the Mini Program |
+//! | `x` | id | leave the app (`Command::ExitApp`) |
 //!
-//! Items this platform does not show yet are left out (`MountItem`'s other
-//! kinds: the README's "Status").
+//! Items this platform does not show yet are left out ([`shown`] says
+//! which; the README's "Not done").
 
 use std::fmt::Write as _;
 
@@ -39,11 +50,58 @@ pub mod events {
     pub const LONG_PRESS: u32 = 4;
     /// `onKeyDown` / `onKeyUp`: the remote's keys go to this view.
     pub const KEYS: u32 = 8;
+    /// `onFocus` / `onBlur`.
+    pub const FOCUS: u32 = 16;
+    /// An image's `onLoad`, `onLoadStart`, `onLoadEnd`.
+    pub const LOAD: u32 = 32;
+    /// An image's `onError`.
+    pub const ERROR: u32 = 64;
 }
 
 /// A batch's operations, `[]` when it has none for this platform.
 pub fn batch(batch: &MountBatch) -> Value {
     Value::Array(batch.items.iter().filter_map(item).collect())
+}
+
+/// Whether this platform shows `item` (or takes it elsewhere: the
+/// animation graph's): the others are counted as skipped.
+pub fn shown(item: &MountItem) -> bool {
+    use nsh_core::MountItem as M;
+    match item {
+        M::Command { command, .. } => matches!(
+            command,
+            nsh_core::Command::Focus
+                | nsh_core::Command::Blur
+                | nsh_core::Command::ScrollTo { .. }
+                | nsh_core::Command::Native { .. }
+                | nsh_core::Command::ExitApp
+        ),
+        M::Create { .. }
+        | M::Insert { .. }
+        | M::Remove { .. }
+        | M::Delete { .. }
+        | M::Frame { .. }
+        | M::ViewStyle { .. }
+        | M::Text { .. }
+        | M::Events { .. }
+        | M::TrackStates { .. }
+        | M::ViewProps { .. }
+        | M::ScrollConfig { .. }
+        | M::ScrollContent { .. }
+        | M::ScrollBy { .. }
+        | M::Image { .. }
+        | M::Input { .. }
+        | M::InputValue { .. }
+        | M::InputContent { .. }
+        | M::Component { .. }
+        | M::ComponentProps { .. }
+        | M::Canvas { .. }
+        | M::Animation(_)
+        | M::AnimationBindings { .. }
+        | M::Gestures { .. }
+        | M::StickyCells { .. } => true,
+        _ => false,
+    }
 }
 
 /// One item's operation, if this platform shows it.
@@ -90,43 +148,60 @@ pub fn item(item: &MountItem) -> Option<Value> {
         }
         MountItem::Events { id, events } => {
             let mut bits = 0;
-            if events.contains(EventKind::Press) {
-                bits |= events::PRESS;
-            }
-            if events.contains(EventKind::PressDown) || events.contains(EventKind::PressUp) {
-                bits |= events::PRESS_IN_OUT;
-            }
-            if events.contains(EventKind::LongPress) {
-                bits |= events::LONG_PRESS;
-            }
-            if events.contains(EventKind::KeyDown) || events.contains(EventKind::KeyUp) {
-                bits |= events::KEYS;
-            }
+            let mut set = |kinds: &[EventKind], bit: u32| {
+                if kinds.iter().any(|k| events.contains(*k)) {
+                    bits |= bit;
+                }
+            };
+            set(&[EventKind::Press], events::PRESS);
+            set(
+                &[EventKind::PressDown, EventKind::PressUp],
+                events::PRESS_IN_OUT,
+            );
+            set(&[EventKind::LongPress], events::LONG_PRESS);
+            set(&[EventKind::KeyDown, EventKind::KeyUp], events::KEYS);
+            set(&[EventKind::Focus, EventKind::Blur], events::FOCUS);
+            set(
+                &[EventKind::Load, EventKind::LoadStart, EventKind::LoadEnd],
+                events::LOAD,
+            );
+            set(&[EventKind::Error], events::ERROR);
             json!(["e", id, bits])
+        }
+        MountItem::TrackStates { id, states } => json!(["ts", id, states]),
+        MountItem::ViewProps { id, props } => {
+            json!(["vp", id, props.focusable, props.test_id.as_deref()])
         }
         MountItem::ScrollConfig { id, horizontal, .. } => json!(["sc", id, horizontal]),
         MountItem::ScrollContent { id, size } => {
             json!(["ss", id, round(size.width.0), round(size.height.0)])
         }
+        MountItem::ScrollBy { id, dx, dy } => json!(["sb", id, round(dx.0), round(dy.0)]),
         MountItem::Image {
             id,
             source,
             resize_mode,
-            ..
+            options,
         } => {
-            let mode = match resize_mode {
-                nsh_core::ResizeMode::Cover => "aspectFill",
-                nsh_core::ResizeMode::Contain | nsh_core::ResizeMode::ScaleDown => "aspectFit",
-                nsh_core::ResizeMode::Stretch => "scaleToFill",
-                nsh_core::ResizeMode::Center => "center",
+            let fit = match resize_mode {
+                nsh_core::ResizeMode::Cover => "cover",
+                nsh_core::ResizeMode::Contain => "contain",
+                nsh_core::ResizeMode::ScaleDown => "scale-down",
+                nsh_core::ResizeMode::Stretch => "fill",
+                nsh_core::ResizeMode::Center => "none",
             };
-            json!(["im", id, source.as_ref().map(|s| image_src(&s.uri)), mode])
+            let position = object_position(&options.position);
+            json!([
+                "im",
+                id,
+                source.as_ref().map(|s| image_src(&s.uri)),
+                fit,
+                options.placeholder.as_ref().map(|s| image_src(&s.uri)),
+                round(options.blur_radius.0),
+                position,
+                options.current_color.map(color)
+            ])
         }
-        MountItem::ScreenConfig { id, config } => json!(["scr", id, {
-            "title": config.title.as_deref(),
-            "header": config.header_view,
-            "preventBack": config.prevent_back,
-        }]),
         MountItem::Canvas { id, drawing } => {
             json!([
                 "cv",
@@ -134,7 +209,6 @@ pub fn item(item: &MountItem) -> Option<Value> {
                 serde_json::from_str::<Value>(&crate::canvas::encode(drawing)).ok()?
             ])
         }
-        MountItem::TrackStates { id, states } => json!(["ts", id, states]),
         MountItem::Input { id, config } => json!(["in", id, input(config)]),
         MountItem::InputValue { id, text, count } => json!(["iv", id, text, count]),
         MountItem::InputContent { id, content } => json!([
@@ -145,27 +219,53 @@ pub fn item(item: &MountItem) -> Option<Value> {
             round(content.size.width.0),
             round(content.size.height.0)
         ]),
-        MountItem::Command {
-            id,
-            command: nsh_core::Command::Focus,
-        } => json!(["fo", id, true]),
-        MountItem::Command {
-            id,
-            command: nsh_core::Command::Blur,
-        } => json!(["fo", id, false]),
-        MountItem::ScrollBy { id, dx, dy } => json!(["sb", id, round(dx.0), round(dy.0)]),
-        MountItem::Command {
-            id,
-            command: nsh_core::Command::ScrollTo { x, y, animated },
-        } => json!(["st", id, round(x.0), round(y.0), animated]),
+        MountItem::Component { id, name } => json!(["n", id, &**name]),
+        MountItem::ComponentProps { id, props } => {
+            let changed: serde_json::Map<String, Value> = props
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone().unwrap_or(Value::Null)))
+                .collect();
+            json!(["np", id, changed])
+        }
+        MountItem::Command { id, command } => match command {
+            nsh_core::Command::Focus => json!(["fo", id, true]),
+            nsh_core::Command::Blur => json!(["fo", id, false]),
+            nsh_core::Command::ScrollTo { x, y, animated } => {
+                json!(["st", id, round(x.0), round(y.0), animated])
+            }
+            nsh_core::Command::Native { name, args } => json!(["nc", id, &**name, args]),
+            nsh_core::Command::ExitApp => json!(["x", id]),
+            _ => return None,
+        },
         _ => return None,
     })
 }
 
-/// An input's configuration as the `<input>` / `<textarea>` components
-/// take it.
+/// `objectPosition` as CSS's `object-position` (`""` for the center, the
+/// default).
+fn object_position(p: &nsh_core::ObjectPosition) -> String {
+    if *p == nsh_core::ObjectPosition::CENTER {
+        return String::new();
+    }
+    let axis = |a: &nsh_core::PositionAxis, start: &str, end: &str| {
+        let offset = crate::effects::origin(a.offset);
+        format!("{} {offset}", if a.from_end { end } else { start })
+    };
+    format!(
+        "{} {}",
+        axis(&p.x, "left", "right"),
+        axis(&p.y, "top", "bottom")
+    )
+}
+
+/// An input's configuration as the page's `<input>` / `<textarea>` takes
+/// it: `css` (font, color, caret, alignment), `ph` / `phc` (placeholder and
+/// its color), `type` (`text`, `password`, `number`, `email`, `tel`,
+/// `url`), `ml` (multiline), `max` (-1: none), `off` (not editable),
+/// `submit` (`blur`, `keep` or `newline`: what the keyboard's Done does),
+/// `auto` (focus once on screen).
 fn input(config: &nsh_core::InputConfig) -> Value {
-    use nsh_core::{KeyboardType as K, ReturnKeyType as R, TextAlign};
+    use nsh_core::{KeyboardType as K, SubmitBehavior as S, TextAlign};
     let style = &config.style;
     let name = style.font_family.as_ref().map(|f| f.name());
     let font = crate::text::font_css(
@@ -178,37 +278,37 @@ fn input(config: &nsh_core::InputConfig) -> Value {
     if let Some(c) = config.caret_color {
         let _ = write!(css, "caret-color:{};", color(c));
     }
+    if config.caret_hidden {
+        css.push_str("caret-color:transparent;");
+    }
     match config.align {
         TextAlign::Center => css.push_str("text-align:center;"),
         TextAlign::Right => css.push_str("text-align:right;"),
         _ => {}
     }
+    // The TV's keyboard picks its layout by the input's type.
     let kind = match config.keyboard {
-        K::Number => "number",
-        K::Decimal | K::Numeric => "digit",
+        _ if config.secure => "password",
+        K::Number | K::Decimal | K::Numeric => "number",
+        K::Email => "email",
+        K::Phone => "tel",
+        K::Url => "url",
         _ => "text",
     };
-    let confirm = match config.return_key {
-        R::Done | R::Default => "done",
-        R::Go => "go",
-        R::Next => "next",
-        R::Search => "search",
-        R::Send => "send",
+    let submit = match config.submit() {
+        S::BlurAndSubmit => "blur",
+        S::Submit => "keep",
+        S::Newline => "newline",
     };
-    let placeholder_color = config
-        .placeholder_color
-        .map(|c| format!("color:{};", color(c)));
     json!({
         "css": css,
         "ph": config.placeholder,
-        "phs": placeholder_color.unwrap_or_default(),
-        "pw": config.secure,
+        "phc": config.placeholder_color.map(color),
         "type": kind,
         "ml": config.multiline,
         "max": config.max_length.map_or(-1, i64::from),
         "off": !config.editable,
-        "confirm": confirm,
-        "hold": !config.blur_on_submit,
+        "submit": submit,
         "auto": config.auto_focus,
     })
 }
@@ -224,15 +324,18 @@ fn kind_name(kind: ViewKind) -> &'static str {
         ViewKind::Screen => "screen",
         ViewKind::Modal => "modal",
         ViewKind::Input => "input",
+        ViewKind::Native => "native",
         _ => "view",
     }
 }
 
-/// An image URI as the `<image>` component loads it: an app's own file
-/// (`asset:/x.png`) from the package's `assets/`, a URL as it is.
-fn image_src(uri: &str) -> String {
+/// An image URI as the page's `<img>` loads it: an app's own file
+/// (`asset:/x.png`) from the package's `assets/` (next to the page), a URL
+/// as it is. An image whose bytes are in memory keeps its key URI, which
+/// the page maps to the blob it was given (`image_bytes`).
+pub fn image_src(uri: &str) -> String {
     match uri.strip_prefix("asset:/") {
-        Some(path) => format!("/assets/{}", path.trim_start_matches('/')),
+        Some(path) => format!("assets/{}", path.trim_start_matches('/')),
         None => uri.to_owned(),
     }
 }
@@ -371,7 +474,7 @@ mod tests {
 
     #[test]
     fn image_sources() {
-        assert_eq!(image_src("asset:/img/a.png"), "/assets/img/a.png");
+        assert_eq!(image_src("asset:/img/a.png"), "assets/img/a.png");
         assert_eq!(image_src("https://x.dev/a.png"), "https://x.dev/a.png");
     }
 }

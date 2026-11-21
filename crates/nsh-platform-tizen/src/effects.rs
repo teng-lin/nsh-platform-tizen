@@ -140,7 +140,7 @@ pub(crate) fn transform(t: &Transform, value: impl Fn(usize) -> Option<f32>) -> 
     out.trim_end().to_owned()
 }
 
-fn origin(o: DefiniteLength) -> String {
+pub(crate) fn origin(o: DefiniteLength) -> String {
     match o {
         DefiniteLength::Absolute(v) => format!("{}px", v.to_points(REM_SIZE).0),
         DefiniteLength::Fraction(f) => format!("{}%", f.0 * 100.0),

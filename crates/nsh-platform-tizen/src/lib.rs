@@ -1,31 +1,31 @@
-//! A community-maintained NSH platform: Native Shell apps in WeChat mini
-//! programs. It is also the worked example of NSH's platform extension
-//! points (NSH's `docs/dev/platforms.md`): a backend built only on NSH's
-//! public engine API, outside NSH's repository.
+//! An NSH platform for Samsung Tizen TVs (Tizen 5.5 and later: Chromium 69,
+//! ES2017, MVP WebAssembly), built only on NSH's public engine API outside
+//! NSH's repository (NSH's `docs/dev/platforms.md`). It started from
+//! `nsh-platform-miniprogram` (NOTICE).
 //!
 //! How it fits together:
 //!
 //! - The engine ([`nsh_engine::LocalEngine`]: the core, layout, the
-//!   reactive graph and the app's Rust components) runs in WebAssembly in
-//!   the Mini Program's logic layer, driven by its timers ([`Runtime`]).
+//!   reactive graph and the app's Rust components) runs in WebAssembly in a
+//!   Web Worker (`runtime/worker.js`), driven by its timers ([`Runtime`]).
 //! - Each commit's [`nsh_core::MountBatch`] becomes JSON operations
-//!   ([`encode`]) that the runtime `runtime/nsh-tz.js` applies to a tree of
-//!   plain objects and hands to the render layer with `setData`; a
-//!   recursive component (`runtime/components/nsh-node`) draws each node at
-//!   the frame the engine laid out.
-//! - Text is measured with the host's fonts and broken into lines here
-//!   ([`text`]); the render layer draws the lines where they were placed.
-//! - Taps come back as `onPress` / `onPressIn` / `onPressOut` events, and
-//!   scroll views report their offsets, through [`EngineControl`].
+//!   ([`encode`]) that the page (`runtime/renderer.js`) applies to the DOM:
+//!   each view an absolutely positioned element at the frame the engine
+//!   laid out.
+//! - Text is measured in the Worker (`OffscreenCanvas`) and broken into
+//!   runs here ([`text`]); the page draws each run where it was placed.
+//! - Native components (`native("name")`) are the host page's: it
+//!   registers an implementation per name (`NshTizen.registerComponent`),
+//!   which gets the component's props and frame and emits its events.
+//! - The remote's keys arrive as NSH key events with the DOM's names
+//!   ([`keys`]), inputs are `<input>` elements over the TV's keyboard.
 //!
-//! The platform names itself `"miniprogram"` (`platform.name`,
-//! [`Environment::platform`]) and reports the OS of the device WeChat
-//! runs on in `platform.os` (iOS, Android, or a desktop OS in WeChat for
-//! PC), a phone ([`Idiom::Phone`]).
+//! The platform names itself `"tizen"` (`platform.name`,
+//! [`Environment::platform`]) on [`Os::Web`] with [`Idiom::Tv`].
 //!
-//! A runner crate (the CLI writes it) starts an app with [`app!`] and links
-//! this crate for `wasm32-unknown-unknown`, where [`ffi`] exports the
-//! functions `nsh-tz.js` calls.
+//! A runner crate starts an app with [`app!`] and links this crate for
+//! `wasm32-unknown-unknown`, where [`ffi`] exports the functions the
+//! runtime calls.
 
 mod anim;
 pub mod canvas;
@@ -33,10 +33,12 @@ mod effects;
 pub mod encode;
 #[cfg(target_arch = "wasm32")]
 pub mod ffi;
+pub mod font;
+pub mod keys;
 pub mod text;
 
-/// Where time goes, for the spike: milliseconds per stage, read and reset by
-/// the page (`nsh_tz_stat`).
+/// Where time goes: milliseconds per stage, read and reset by the runtime
+/// (`nsh_tz_stat`) for its timing recorder.
 pub mod stats {
     use std::cell::Cell;
 
@@ -48,10 +50,18 @@ pub mod stats {
     pub const SERIALIZE: usize = 2;
     /// Text layout requests (`TextEngine` calls).
     pub const TEXT: usize = 3;
-    const N: usize = 4;
+    /// Operations left out because nothing changed for the page (a style
+    /// or text encoded as the one it has): a count, not milliseconds.
+    pub const DEDUPED: usize = 4;
+    const N: usize = 5;
 
     thread_local! {
         static MS: [Cell<f64>; N] = const { [const { Cell::new(0.0) }; N] };
+    }
+
+    /// Adds `n` to counter `stage`.
+    pub fn count(stage: usize, n: f64) {
+        MS.with(|m| m[stage].set(m[stage].get() + n));
     }
 
     /// Adds the time since `since` to stage `stage`.
@@ -66,8 +76,8 @@ pub mod stats {
     }
 }
 
-/// Sends `message` (JSON) to the page (`host` in `nsh-tz.js`): what the app
-/// asks of the TV beyond drawing. A no-op off the TV (tests).
+/// Sends `message` (JSON) to the host page (its `onHost` option): what an
+/// app asks of its host beyond drawing. A no-op off the TV (tests).
 pub fn host(message: &str) {
     #[cfg(target_arch = "wasm32")]
     ffi::host(message);
@@ -75,13 +85,18 @@ pub fn host(message: &str) {
     let _ = message;
 }
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex},
+};
 
 use nsh_core::MountBatch;
 use nsh_core::{
     EventKind, EventPayload, Points, Size,
     element::{Registry, Root},
-    geometry::point,
+    geometry::{DevicePixels, point},
+    image::ImageData,
     platform::{ColorScheme, Idiom, Os},
 };
 use nsh_engine::{App, EngineConfig, EngineControl, Environment, LocalEngine, MountSink};
@@ -89,12 +104,10 @@ use serde_json::Value;
 
 use crate::text::{Measure, TizenTextEngine};
 
-/// The name this platform reports in `platform.name` and is selected with
-/// (`nsh run --target miniprogram`).
+/// The name this platform reports in `platform.name`.
 pub const PLATFORM_NAME: &str = "tizen";
 
-/// What the Mini Program reports about the device at start
-/// (`wx.getWindowInfo()`, `wx.getAppBaseInfo()`).
+/// What the page reports about the TV at start.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Device {
     /// The page's size in px (points).
@@ -105,7 +118,7 @@ pub struct Device {
     pub pixel_ratio: f32,
     /// The system shows dark mode.
     pub dark: bool,
-    /// The OS WeChat runs on (`wx.getDeviceInfo().platform`).
+    /// The OS: [`Os::Web`] (a Tizen app is a web app).
     pub os: Os,
 }
 
@@ -142,17 +155,62 @@ impl Device {
     }
 }
 
-/// What the engine hands the Mini Program between two pumps.
+/// What the engine hands the page between two pumps.
 #[derive(Default)]
 struct Outbox {
     /// Each commit's operations ([`encode::batch`]), in order.
     batches: Vec<Value>,
+    /// Images whose bytes are in memory, for the page to show by their URI
+    /// (before the batches that show them).
+    images: Vec<(String, ImageData)>,
     /// The engine asked for a display frame.
     frame: bool,
     /// Errors of the app, as text.
     errors: Vec<String>,
     /// The native animation graph, which the batches drive.
     anim: anim::Anim,
+    /// What the page was last given per view, to leave out a style or a
+    /// text encoded as the one it has.
+    sent: Sent,
+}
+
+/// Hashes of the last `s` and `t` operation per view, and the in-memory
+/// images the page has.
+#[derive(Default)]
+struct Sent {
+    styles: HashMap<u32, u64>,
+    texts: HashMap<u32, u64>,
+    images: HashSet<Arc<str>>,
+}
+
+fn hash(value: &impl Hash) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut h);
+    h.finish()
+}
+
+impl Sent {
+    /// Whether `op` (an item's operation) changes what the page shows:
+    /// false for a style or a text the view already has. The core sends
+    /// a style when any of its fields changed, including ones this
+    /// platform does not draw, and a text when its layout object is new.
+    fn changes(&mut self, op: &Value) -> bool {
+        let (Some(code), Some(id)) = (op[0].as_str(), op[1].as_u64()) else {
+            return true;
+        };
+        let id = id as u32;
+        let (map, h) = match code {
+            "s" => (&mut self.styles, hash(&op[2].as_str())),
+            "t" => (&mut self.texts, hash(&op[2].to_string())),
+            "d" => {
+                self.styles.remove(&id);
+                self.texts.remove(&id);
+                return true;
+            }
+            _ => return true,
+        };
+        map.insert(id, h) != Some(h)
+    }
 }
 
 /// The engine's [`MountSink`]: encodes each commit into the outbox.
@@ -162,16 +220,29 @@ impl MountSink for Sink {
     fn submit(&self, batch: MountBatch) {
         let started = nsh_core::time::now();
         let mut outbox = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let outbox = &mut *outbox;
         // Each item is encoded once.
         let mut list = Vec::with_capacity(batch.items.len());
+        let mut deduped = 0;
         for item in &batch.items {
             outbox.anim.apply(item);
+            if let nsh_core::MountItem::Image {
+                source: Some(source),
+                ..
+            } = item
+                && let Some(data) = &source.data
+                && outbox.sent.images.insert(source.uri.clone())
+            {
+                outbox.images.push((source.uri.to_string(), data.clone()));
+            }
             match encode::item(item) {
-                Some(op) => list.push(op),
-                None if !animation(item) => skipped(item),
+                Some(op) if outbox.sent.changes(&op) => list.push(op),
+                Some(_) => deduped += 1,
+                None if !encode::shown(item) => skipped(item),
                 None => {}
             }
         }
+        stats::count(stats::DEDUPED, f64::from(deduped));
         // Bound properties follow the styles just set.
         list.extend(outbox.anim.outputs());
         if !list.is_empty() {
@@ -191,40 +262,42 @@ impl MountSink for Sink {
     }
 }
 
-/// Items the animation graph takes ([`anim::Anim`]).
-fn animation(item: &nsh_core::MountItem) -> bool {
-    use nsh_core::MountItem as M;
-    matches!(
-        item,
-        M::Animation(_) | M::AnimationBindings { .. } | M::Gestures { .. } | M::StickyCells { .. }
-    )
-}
-
 /// Logs each kind of mount item this platform does not show yet, once:
-/// what an app uses that the Mini Program leaves out.
+/// what an app uses that the TV leaves out (the README's "Not done").
 fn skipped(item: &nsh_core::MountItem) {
-    use std::{collections::HashSet, sync::OnceLock};
+    use std::sync::OnceLock;
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let debug = format!("{item:?}");
-    let kind = debug
+    let mut kind: String = debug
         .split(|c: char| !c.is_alphanumeric())
         .next()
         .unwrap_or_default()
         .to_owned();
+    if let nsh_core::MountItem::Command { command, .. } = item {
+        let name = format!("{command:?}");
+        let name = name
+            .split(|c: char| !c.is_alphanumeric())
+            .next()
+            .unwrap_or_default();
+        kind = format!("Command::{name}");
+    }
     let mut seen = SEEN
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if seen.insert(kind.clone()) {
-        log::info!("not shown on this platform yet: MountItem::{kind}");
+        log::warn!("not shown on this platform: MountItem::{kind}");
     }
 }
 
-/// What a pump leaves for the Mini Program to do.
-#[derive(Debug, Default, PartialEq)]
+/// What a pump leaves for the page to do.
+#[derive(Default)]
 pub struct Pumped {
     /// The operations of the commits it made, one array per commit.
     pub batches: Vec<Value>,
+    /// Images whose bytes are in memory, by the URI the batches show them
+    /// by: the page needs them first.
+    pub images: Vec<(String, ImageData)>,
     /// Call [`Runtime::frame`] at the next display frame.
     pub frame: bool,
     /// Pump again in this many milliseconds (`None`: only on input).
@@ -249,17 +322,14 @@ impl<M: Measure + 'static> Runtime<M> {
         let config = EngineConfig {
             viewport: Size::new(Points(device.width), Points(device.height)),
             environment: device.environment(),
-            // NSH draws no header: the Mini Program's navigation bar is the
-            // system's, and a page's `header` slot sits at its top.
+            // A TV page has no system header: a screen's `header` slot
+            // sits at its top.
             header_heights: nsh_core::NO_NATIVE_HEADER,
             ui_sets,
             ..EngineConfig::new(App::Rust(root))
         };
-        let engine = LocalEngine::start(
-            config,
-            TizenTextEngine::new(measure),
-            Sink(outbox.clone()),
-        )?;
+        let engine =
+            LocalEngine::start(config, TizenTextEngine::new(measure), Sink(outbox.clone()))?;
         let control = engine.control();
         Some(Runtime {
             engine,
@@ -281,6 +351,7 @@ impl<M: Measure + 'static> Runtime<M> {
         let animating = outbox.anim.animating();
         Pumped {
             batches: std::mem::take(&mut outbox.batches),
+            images: std::mem::take(&mut outbox.images),
             frame: std::mem::take(&mut outbox.frame) || animating,
             next: deadline.map(|at| {
                 at.saturating_duration_since(nsh_core::time::Instant::now())
@@ -354,15 +425,87 @@ impl<M: Measure + 'static> Runtime<M> {
         self.pump()
     }
 
-    /// A remote key went down or up on view `id` (a view listening for
-    /// keys): `key` and `code` as the DOM spells them.
+    /// A key went down or up on view `id` (the focused view, or the view
+    /// the page sends keys to): `key` and `code` as the DOM spells them.
+    /// The core routes it to `id` and its listening ancestors.
     pub fn key(&mut self, id: u32, key: &str, code: &str, down: bool, repeat: bool) -> Pumped {
         let mut event = nsh_core::keyboard::KeyEvent::default();
         event.key = key.to_owned().into();
         event.code = code.to_owned().into();
         event.repeat = repeat;
-        let kind = if down { EventKind::KeyDown } else { EventKind::KeyUp };
-        self.control.dispatch_event(id, kind, EventPayload::Key(event));
+        let kind = if down {
+            EventKind::KeyDown
+        } else {
+            EventKind::KeyUp
+        };
+        self.control
+            .dispatch_event(id, kind, EventPayload::Key(event));
+        self.pump()
+    }
+
+    /// A remote key with Samsung's code `key_code`, which the browser
+    /// reported as `dom_key` / `dom_code`: [`Runtime::key`] with the DOM's
+    /// name for it ([`keys::key_name`]).
+    pub fn remote_key(
+        &mut self,
+        id: u32,
+        key_code: u32,
+        dom_key: &str,
+        dom_code: &str,
+        down: bool,
+        repeat: bool,
+    ) -> Pumped {
+        let key = keys::key_name(key_code, dom_key).to_owned();
+        self.key(id, &key, dom_code, down, repeat)
+    }
+
+    /// Native component `id` emitted `name` with `data`.
+    pub fn native_event(&mut self, id: u32, name: &str, data: Value) -> Pumped {
+        self.control.dispatch_event(
+            id,
+            EventKind::NativeEvent,
+            EventPayload::Native {
+                name: name.into(),
+                data,
+            },
+        );
+        self.pump()
+    }
+
+    /// View `id` (an input, or a focusable view the app focused) took the
+    /// focus or lost it.
+    pub fn focus(&mut self, id: u32, focused: bool) -> Pumped {
+        let kind = if focused {
+            EventKind::Focus
+        } else {
+            EventKind::Blur
+        };
+        self.control.dispatch_event(id, kind, EventPayload::None);
+        self.pump()
+    }
+
+    /// Image `id` loaded (`Ok`: its size in pixels) or failed.
+    pub fn image(&mut self, id: u32, result: Result<(i32, i32), String>) -> Pumped {
+        match result {
+            Ok((width, height)) => self.control.dispatch_event(
+                id,
+                EventKind::Load,
+                EventPayload::Image(Size::new(DevicePixels(width), DevicePixels(height))),
+            ),
+            Err(message) => {
+                self.control
+                    .dispatch_event(id, EventKind::Error, EventPayload::Error { message })
+            }
+        }
+        self.control
+            .dispatch_event(id, EventKind::LoadEnd, EventPayload::None);
+        self.pump()
+    }
+
+    /// Fonts finished loading on the host: text measured before is
+    /// measured again.
+    pub fn fonts_changed(&mut self) -> Pumped {
+        self.control.fonts_changed();
         self.pump()
     }
 
@@ -375,7 +518,7 @@ impl<M: Measure + 'static> Runtime<M> {
     }
 }
 
-/// Makes the runner a Mini Program's runtime of a Rust app: `$sets` are
+/// Makes the runner a Tizen runtime of a Rust app: `$sets` are
 /// its UI sets (`nsh/base` and the app's, a `Vec<Registry>`) and `$root`
 /// its root (a [`Root`]), as NSH's generated crate `nsh_rust_app` gives
 /// them:
@@ -386,7 +529,7 @@ impl<M: Measure + 'static> Runtime<M> {
 #[macro_export]
 macro_rules! app {
     ($sets:expr, $root:expr) => {
-        /// Registers the app (`nsh-tz.js` calls it before starting).
+        /// Registers the app (the runtime calls it before starting).
         #[cfg(target_arch = "wasm32")]
         #[unsafe(no_mangle)]
         pub extern "C" fn nsh_tz_init() {
@@ -457,6 +600,226 @@ mod tests {
             && op[2] == "background-color:rgb(37,99,235);"));
         let pressed = runtime.event(button, "onPress");
         assert_eq!(texts(&pressed), ["Count 1"]);
+    }
+
+    /// Every operation of a pump, in order.
+    fn ops(pumped: &Pumped) -> Vec<Value> {
+        pumped
+            .batches
+            .iter()
+            .flat_map(|b| b.as_array().unwrap().clone())
+            .collect()
+    }
+
+    /// The first operation `code` on any view, and its view.
+    fn find<'a>(ops: &'a [Value], code: &str) -> (&'a Value, u32) {
+        let op = ops
+            .iter()
+            .find(|op| op[0] == code)
+            .unwrap_or_else(|| panic!("no {code} in {ops:?}"));
+        (op, op[1].as_u64().unwrap() as u32)
+    }
+
+    fn start(root: Root) -> (Runtime<ApproxMeasure>, Vec<Value>) {
+        let mut runtime =
+            Runtime::start(root, Vec::new(), Device::default(), ApproxMeasure).unwrap();
+        let first = ops(&runtime.pump());
+        (runtime, first)
+    }
+
+    #[component]
+    fn Player() -> impl IntoElement {
+        let state = signal(String::from("none"));
+        let paused = signal(false);
+        view()
+            .on_key_down(move |e: &KeyEvent| {
+                if &*e.key == "MediaPlayPause" {
+                    paused.update(|p| *p = !*p);
+                }
+            })
+            .child(
+                native("test.player")
+                    .w(px(320.0))
+                    .h(px(180.0))
+                    .prop(
+                        "source",
+                        serde_json::json!({ "url": "https://x.test/a.m3u8", "token": 7 }),
+                    )
+                    .prop("paused", move || serde_json::json!(paused.get()))
+                    .on_native_event(move |e: &NativeEvent| {
+                        state.set(format!(
+                            "{} {}",
+                            e.name,
+                            e.data["state"].as_str().unwrap_or("?")
+                        ))
+                    }),
+            )
+            .child(text(move || state.get()))
+    }
+
+    #[test]
+    fn native_components_get_their_props_and_report_events() {
+        let (mut runtime, first) = start(Root::of::<Player>());
+        let (create, id) = first
+            .iter()
+            .find(|op| op[0] == "c" && op[2] == "native")
+            .map(|op| (op, op[1].as_u64().unwrap() as u32))
+            .expect("a native container");
+        assert_eq!(create[2], "native");
+        assert!(
+            first
+                .iter()
+                .any(|op| op[0] == "n" && op[1] == id && op[2] == "test.player")
+        );
+        let props = first
+            .iter()
+            .find(|op| op[0] == "np" && op[1] == id)
+            .unwrap();
+        assert_eq!(props[2]["source"]["token"], 7);
+        assert_eq!(props[2]["paused"], false);
+        assert!(
+            first
+                .iter()
+                .any(|op| op[0] == "f" && op[1] == id && op[4] == 320.0)
+        );
+        // A prop that changes is sent alone.
+        let (_, listener) = find(&first, "e");
+        let toggled = ops(&runtime.remote_key(listener, 10252, "", "", true, false));
+        let props = toggled.iter().find(|op| op[0] == "np").unwrap();
+        assert_eq!(props[2], serde_json::json!({ "paused": true }));
+        // Its events reach the app.
+        let event = runtime.native_event(id, "state", serde_json::json!({ "state": "playing" }));
+        assert_eq!(texts(&event), ["state playing"]);
+    }
+
+    #[component]
+    fn Search() -> impl IntoElement {
+        let query = signal(String::new());
+        let submitted = signal(String::new());
+        let focus = element_ref();
+        view()
+            .on_key_down(move |e: &KeyEvent| {
+                if &*e.key == "ColorF0Red" {
+                    focus.focus();
+                }
+            })
+            .child(
+                nsh_core::element::input()
+                    .element_ref(&focus)
+                    .w(px(400.0))
+                    .h(px(48.0))
+                    .placeholder("Search")
+                    .value(move || query.get())
+                    .on_change(move |t: &str| query.set(t.to_owned()))
+                    .on_submit(move |t: &str| submitted.set(t.to_owned())),
+            )
+            .child(text(move || format!("{}|{}", query.get(), submitted.get())))
+    }
+
+    #[test]
+    fn inputs_focus_take_the_users_text_and_submit() {
+        let (mut runtime, first) = start(Root::of::<Search>());
+        let (config, input) = find(&first, "in");
+        assert_eq!(config[2]["ph"], "Search");
+        assert_eq!(config[2]["type"], "text");
+        assert_eq!(config[2]["submit"], "blur");
+        assert!(first.iter().any(|op| op[0] == "ic" && op[1] == input));
+        // Red focuses it: the page gets the command.
+        let listener = first
+            .iter()
+            .find(|op| op[0] == "e" && op[2].as_u64().unwrap() as u32 & encode::events::KEYS != 0)
+            .map(|op| op[1].as_u64().unwrap() as u32)
+            .unwrap();
+        let red = ops(&runtime.remote_key(listener, 403, "", "", true, false));
+        assert!(
+            red.iter()
+                .any(|op| *op == serde_json::json!(["fo", input, true])),
+            "{red:?}"
+        );
+        runtime.focus(input, true);
+        let typed = runtime.text(input, "onChangeText", "news".into(), 1);
+        assert_eq!(texts(&typed), ["news|"]);
+        let submitted = runtime.text(input, "onSubmitEditing", "news".into(), 1);
+        assert_eq!(texts(&submitted), ["news|news"]);
+    }
+
+    #[component]
+    fn Logo() -> impl IntoElement {
+        let status = signal(String::from("loading"));
+        view()
+            .child(
+                image("asset:/logo.png")
+                    .w(px(64.0))
+                    .h(px(64.0))
+                    .on_load(move |s: &Size<DevicePixels>| {
+                        status.set(format!("{}x{}", s.width.0, s.height.0))
+                    })
+                    .on_error(move |m: &str| status.set(format!("error {m}"))),
+            )
+            .child(text(move || status.get()))
+    }
+
+    #[test]
+    fn images_load_from_the_package_and_report() {
+        let (mut runtime, first) = start(Root::of::<Logo>());
+        let (op, id) = find(&first, "im");
+        assert_eq!(op[2], "assets/logo.png");
+        assert_eq!(op[3], "cover");
+        let events = first.iter().find(|op| op[0] == "e" && op[1] == id).unwrap();
+        let bits = events[2].as_u64().unwrap() as u32;
+        assert_ne!(bits & encode::events::LOAD, 0);
+        assert_ne!(bits & encode::events::ERROR, 0);
+        assert_eq!(texts(&runtime.image(id, Ok((128, 96)))), ["128x96"]);
+        assert_eq!(texts(&runtime.image(id, Err("404".into()))), ["error 404"]);
+    }
+
+    #[test]
+    fn unchanged_styles_and_texts_are_not_sent_again() {
+        let mut sent = Sent::default();
+        let style = serde_json::json!(["s", 4, "opacity:0.5;"]);
+        assert!(sent.changes(&style));
+        assert!(!sent.changes(&style));
+        assert!(sent.changes(&serde_json::json!(["s", 4, ""])));
+        let text = serde_json::json!(["t", 4, { "runs": [["a", 0, 0, 10, 0]] }]);
+        assert!(sent.changes(&text));
+        assert!(!sent.changes(&text));
+        // A view made again under the same id gets everything.
+        assert!(sent.changes(&serde_json::json!(["d", 4])));
+        assert!(sent.changes(&text));
+    }
+
+    /// A registered font: family, weight, italic, file size.
+    type Registered = (String, u16, bool, usize);
+
+    #[derive(Default, Clone)]
+    struct Fonts(std::rc::Rc<std::cell::RefCell<Vec<Registered>>>);
+
+    impl Measure for Fonts {
+        fn width(&self, font: &str, text: &str) -> f32 {
+            ApproxMeasure.width(font, text)
+        }
+
+        fn register_font(&self, face: &font::Face, data: &[u8]) -> Result<(), String> {
+            self.0
+                .borrow_mut()
+                .push((face.family.clone(), face.weight, face.italic, data.len()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_apps_fonts_reach_the_host() {
+        let fonts = Fonts::default();
+        let file = font::tests::font("Guide Sans", 600, false);
+        let root = Root::of::<Counter>().font(file.clone());
+        let mut runtime =
+            Runtime::start(root, Vec::new(), Device::default(), fonts.clone()).unwrap();
+        runtime.pump();
+        assert_eq!(
+            *fonts.0.borrow(),
+            [("Guide Sans".to_owned(), 600, false, file.len())]
+        );
+        runtime.fonts_changed();
     }
 
     #[test]

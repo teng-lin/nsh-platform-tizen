@@ -1,18 +1,23 @@
-//! The WebAssembly module's interface with `runtime/nsh-tz.js`, the mini
-//! program's side. Strings cross as a pointer and a length into this
-//! module's memory (UTF-8); JS copies them before a call returns.
+//! The WebAssembly module's interface with the runtime
+//! (`runtime/engine.js`, in the Worker). Strings cross as a pointer and a
+//! length into this module's memory (UTF-8); JS copies them before a call
+//! returns. No 64-bit integer crosses (Tizen 5.5's engine has no BigInt
+//! integration): counts and ids are `u32`, times `f64`.
 //!
 //! Exports: `nsh_tz_alloc` / `nsh_tz_free` (memory for strings JS passes),
 //! `nsh_tz_init` (the runner's [`crate::app!`]), `nsh_tz_start`,
-//! `nsh_tz_pump`, `nsh_tz_frame`, `nsh_tz_event`, `nsh_tz_text`, `nsh_tz_states`,
-//! `nsh_tz_scroll`,
-//! `nsh_tz_device`. After each, what the engine made arrives through the
-//! imports: `submit` per commit, `request_frame`, `schedule` (the next
-//! pump, in ms; -1 for none) and `report_error`.
+//! `nsh_tz_pump`, `nsh_tz_frame`, `nsh_tz_event`, `nsh_tz_text`,
+//! `nsh_tz_states`, `nsh_tz_scroll`, `nsh_tz_key`, `nsh_tz_native`,
+//! `nsh_tz_focus`, `nsh_tz_image`, `nsh_tz_fonts_loaded`, `nsh_tz_device`,
+//! `nsh_tz_stat`. After each, what the engine made arrives through the
+//! imports: `image_bytes` per in-memory image, `submit` per commit,
+//! `request_frame`, `schedule` (the next pump, in ms; -1 for none) and
+//! `report_error`.
 //!
-//! Imports, module `nsh_mp`: those, `measure_text` and `log`. NSH's core
-//! asks for two more, module `nsh`: `now_ms` (a monotonic clock in ms) and
-//! `date_now_ms` (`Date.now()`) (NSH's `docs/dev/platforms.md`).
+//! Imports, module `nsh_tz`: those, `measure_text`, `register_font`,
+//! `remote_keys` (the key table, once at start), `log` and `host`. NSH's
+//! core asks for two more, module `nsh`: `now_ms` (a monotonic clock in
+//! ms) and `date_now_ms` (`Date.now()`) (NSH's `docs/dev/platforms.md`).
 
 use std::cell::RefCell;
 
@@ -36,6 +41,19 @@ unsafe extern "C" {
     fn js_log(level: u32, message: *const u8, len: usize);
     #[link_name = "host"]
     fn js_host(message: *const u8, len: usize);
+    #[link_name = "register_font"]
+    fn js_register_font(
+        family: *const u8,
+        family_len: usize,
+        data: *const u8,
+        data_len: usize,
+        weight: u32,
+        italic: u32,
+    );
+    #[link_name = "image_bytes"]
+    fn js_image_bytes(uri: *const u8, uri_len: usize, data: *const u8, data_len: usize);
+    #[link_name = "remote_keys"]
+    fn js_remote_keys(json: *const u8, len: usize);
 }
 
 /// Sends `message` (JSON) to the page's own code: what the app asks of the
@@ -65,7 +83,8 @@ impl Measure for HostMeasure {
             return w;
         }
         // SAFETY: both ranges are live strings JS only reads during the call.
-        let w = unsafe { js_measure_text(font.as_ptr(), font.len(), text.as_ptr(), text.len()) as f32 };
+        let w =
+            unsafe { js_measure_text(font.as_ptr(), font.len(), text.as_ptr(), text.len()) as f32 };
         WIDTHS.with(|c| {
             let mut c = c.borrow_mut();
             if c.len() >= MEASURE_CACHE {
@@ -74,6 +93,24 @@ impl Measure for HostMeasure {
             c.insert(key, w);
         });
         w
+    }
+
+    fn register_font(&self, face: &crate::font::Face, data: &[u8]) -> Result<(), String> {
+        // SAFETY: live slices JS copies during the call.
+        unsafe {
+            js_register_font(
+                face.family.as_ptr(),
+                face.family.len(),
+                data.as_ptr(),
+                data.len(),
+                u32::from(face.weight),
+                u32::from(face.italic),
+            )
+        };
+        // Widths measured in the fallback font are stale (and again once
+        // the face has loaded: `nsh_tz_fonts_loaded`).
+        WIDTHS.with(|c| c.borrow_mut().clear());
+        Ok(())
     }
 }
 
@@ -84,8 +121,8 @@ thread_local! {
     static RUNTIME: RefCell<Option<Runtime<HostMeasure>>> = const { RefCell::new(None) };
 }
 
-/// The OS `nsh-tz.js` passes: 0 iOS, 1 Android, 2 macOS, 3 Windows,
-/// 4 Linux (`osCode` there).
+/// The OS the runtime passes: 5 (the web) on a TV; 0 iOS, 1 Android,
+/// 2 macOS, 3 Windows, 4 Linux for tests of an app's OS props.
 fn os_of(code: u32) -> nsh_core::platform::Os {
     use nsh_core::platform::Os;
     match code {
@@ -131,6 +168,11 @@ fn report_error(message: &str) {
 
 /// Hands what a pump made to JS.
 fn deliver(pumped: Pumped) {
+    for (uri, data) in &pumped.images {
+        let bytes = data.bytes();
+        // SAFETY: live slices JS copies during the call.
+        unsafe { js_image_bytes(uri.as_ptr(), uri.len(), bytes.as_ptr(), bytes.len()) };
+    }
     for batch in pumped.batches {
         let started = nsh_core::time::now();
         let json = batch.to_string();
@@ -204,6 +246,9 @@ pub extern "C" fn nsh_tz_start(
         dark: dark != 0,
         os: os_of(os),
     };
+    let keys = crate::keys::keys_json();
+    // SAFETY: a live string JS only reads during the call.
+    unsafe { js_remote_keys(keys.as_ptr(), keys.len()) };
     let Some(runtime) = Runtime::start(root, sets, device, HostMeasure) else {
         return 0;
     };
@@ -265,15 +310,19 @@ pub unsafe extern "C" fn nsh_tz_text(
     with_runtime(|r| r.text(id, &name, text, count));
 }
 
-/// A remote key on view `id` (one listening for keys, op `e` bit 8): `key`
-/// and `code` (DOM spellings) are UTF-8 strings from [`nsh_tz_alloc`].
+/// A remote key on view `id` (the focused view, or the one the page sends
+/// keys to): Samsung's `key_code` and the browser's `KeyboardEvent.key` /
+/// `.code` (UTF-8 strings from [`nsh_tz_alloc`]); the app gets the DOM's
+/// name for it ([`crate::keys`]).
 ///
 /// # Safety
 ///
 /// Both strings are memory from [`nsh_tz_alloc`] holding UTF-8.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn nsh_tz_key(
     id: u32,
+    key_code: u32,
     key: *const u8,
     key_len: usize,
     code: *const u8,
@@ -282,15 +331,74 @@ pub unsafe extern "C" fn nsh_tz_key(
     repeat: u32,
 ) {
     // SAFETY: guaranteed by the caller.
-    let (key, code) = unsafe {
-        (
-            std::slice::from_raw_parts(key, key_len),
-            std::slice::from_raw_parts(code, code_len),
-        )
+    let (key, code) = unsafe { (string(key, key_len), string(code, code_len)) };
+    with_runtime(|r| r.remote_key(id, key_code, &key, &code, down != 0, repeat != 0));
+}
+
+/// # Safety
+///
+/// `ptr..ptr + len` is memory from [`nsh_tz_alloc`].
+unsafe fn string(ptr: *const u8, len: usize) -> String {
+    // SAFETY: guaranteed by the caller.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Native component `id` emitted event `name` with `data` (JSON text; an
+/// unreadable one arrives as `null`).
+///
+/// # Safety
+///
+/// Both strings are memory from [`nsh_tz_alloc`] holding UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_tz_native(
+    id: u32,
+    name: *const u8,
+    name_len: usize,
+    data: *const u8,
+    data_len: usize,
+) {
+    // SAFETY: guaranteed by the caller.
+    let (name, data) = unsafe { (string(name, name_len), string(data, data_len)) };
+    let data = serde_json::from_str(&data).unwrap_or(serde_json::Value::Null);
+    with_runtime(|r| r.native_event(id, &name, data));
+}
+
+/// View `id` took (`focused` 1) or lost the focus.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsh_tz_focus(id: u32, focused: u32) {
+    with_runtime(|r| r.focus(id, focused != 0));
+}
+
+/// Image `id` loaded (`ok` 1, `width` × `height` pixels) or failed with
+/// `message` (UTF-8 from [`nsh_tz_alloc`]).
+///
+/// # Safety
+///
+/// `message..message + len` is memory from [`nsh_tz_alloc`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_tz_image(
+    id: u32,
+    ok: u32,
+    width: u32,
+    height: u32,
+    message: *const u8,
+    len: usize,
+) {
+    let result = match ok {
+        // SAFETY: guaranteed by the caller.
+        0 => Err(unsafe { string(message, len) }),
+        _ => Ok((width as i32, height as i32)),
     };
-    let key = String::from_utf8_lossy(key).into_owned();
-    let code = String::from_utf8_lossy(code).into_owned();
-    with_runtime(|r| r.key(id, &key, &code, down != 0, repeat != 0));
+    with_runtime(|r| r.image(id, result));
+}
+
+/// The fonts the app registered have loaded on the page and in the
+/// Worker: widths are measured again.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsh_tz_fonts_loaded() {
+    WIDTHS.with(|c| c.borrow_mut().clear());
+    with_runtime(Runtime::fonts_changed);
 }
 
 /// Milliseconds spent in `stage` (`crate::stats`) since the last read.

@@ -6,7 +6,7 @@ oldest target is Tizen 5.5 (2020 sets: Chromium 69, ES2017, MVP WebAssembly
 with sign-extension and mutable globals, ARMv7). It started as a spike (the
 measurements are at the end) and from
 [nsh-platform-miniprogram](https://github.com/huacnlee/nsh-platform-miniprogram)
-(Apache-2.0, see NOTICE).
+by Jason Lee (Apache-2.0).
 
 - `crates/nsh-platform-tizen`: the backend. The engine (`LocalEngine`) runs
   in WebAssembly, and each commit is encoded as JSON operations
@@ -516,3 +516,10 @@ thread works 30 ms of every 50, with video playing.
 The Worker costs about 11 ms per key idle and wins under load; the page
 stays smooth. Patina's plan (`docs/plans/2026-11-21-browser-tv-architecture.md`)
 adopts it.
+
+## License
+
+Apache License 2.0 (LICENSE). The backend started from
+[nsh-platform-miniprogram](https://github.com/huacnlee/nsh-platform-miniprogram)
+(commit 7bb46ef), Copyright 2026 Jason Lee, also Apache-2.0; NOTICE says
+what was derived and what changed.

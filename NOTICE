@@ -1,7 +1,14 @@
 nsh-platform-tizen
+Copyright 2026 the nsh-platform-tizen authors
 
-The backend in crates/nsh-platform-tizen starts from nsh-platform-miniprogram
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+
+It includes software derived from nsh-platform-miniprogram
 (https://github.com/huacnlee/nsh-platform-miniprogram, commit 7bb46ef),
-Copyright 2026 Jason Lee, licensed under the Apache License 2.0 (LICENSE).
-Changes: renamed, Samsung Tizen TV environment, remote keys, a DOM renderer
-in a Worker, native components, inputs, images and fonts.
+Copyright 2026 Jason Lee, licensed under the Apache License, Version 2.0.
+The backend in crates/nsh-platform-tizen (in particular its encoding, text,
+canvas, effects, animation and FFI modules) started from that project's
+crates/nsh-platform-miniprogram. Changes: renamed; a Samsung Tizen TV
+environment; remote keys and their routing; a DOM renderer run from a Web
+Worker; native components; inputs, images and fonts; and the page runtime
+in runtime/, which was written for this project.

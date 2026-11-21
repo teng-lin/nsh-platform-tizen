@@ -57,6 +57,8 @@ function NshEngine(options) {
     this.lastFont = '';
     this.fontsPending = 0;
     this.dead = false;
+    this.depth = 0;           /* calls into the module now running */
+    this.errorCounts = {};    /* import errors by text */
     this.wakeTimer = null;
     this.M = { moduleFromCache: null, stubbed: [], logs: [], importErrors: [] };
     this.encoder = new TextEncoder();
@@ -71,12 +73,41 @@ function NshEngine(options) {
      * memory may hold a borrowed state). Returns undefined when dead.
      */
     E.call = function (name, a, b, c, d, e, f, g, h) {
-        if (this.dead || !this.ex) return undefined;
+        if (this.dead || !this.ex) {
+            /* Called from inside the module (an import) after it died: the
+             * module's frames must not go on. */
+            if (this.depth > 0) throw new Error('the app stopped');
+            return undefined;
+        }
+        this.depth++;
         try {
             return this.ex[name](a, b, c, d, e, f, g, h);
         } catch (err) {
             this.fatal('the app stopped in ' + name + ': ' + String(err && err.stack || err));
+            /* A nested call (an import calling an export that trapped)
+             * unwinds the outer module call too. */
+            if (this.depth > 1) throw err;
             return undefined;
+        } finally {
+            this.depth--;
+        }
+    };
+
+    /* An export called by a host's hook, with any number of arguments. */
+    E.callWith = function (name, args) {
+        if (args.length <= 8) return this.call(name, args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+        var self = this;
+        if (this.dead || !this.ex) {
+            if (this.depth > 0) throw new Error('the app stopped');
+            return undefined;
+        }
+        this.depth++;
+        try { return this.ex[name].apply(null, args); } catch (err) {
+            this.fatal('the app stopped in ' + name + ': ' + String(err && err.stack || err));
+            if (this.depth > 1) throw err;
+            return undefined;
+        } finally {
+            self.depth--;
         }
     };
 
@@ -92,8 +123,9 @@ function NshEngine(options) {
         this.halt();
         var full = (this.panic ? this.panic + '\n' : '') + text;
         this.M.dead = full.slice(0, 2000);
-        this.out({ t: 'fatal', text: full });
+        /* Metrics first: the page stops listening after the fatal. */
         this.out({ t: 'metrics', m: this.M });
+        this.out({ t: 'fatal', text: full });
     };
 
     /* Stops the engine's timers (a fatal error, or the session ended). */
@@ -119,20 +151,34 @@ function NshEngine(options) {
                 self.fatal('the app stopped in ' + name + ': ' + String(e && e.stack || e));
                 throw e;
             }
-            var text = name + ': ' + String(e && e.stack || e);
-            var seen = self.M.importErrors;
-            for (var i = 0; i < seen.length; i++) if (seen[i].text === text) { seen[i].count++; return 0; }
-            if (seen.length < 20) seen.push({ text: text.slice(0, 500), count: 1 });
+            var text = (name + ': ' + String(e && e.stack || e)).slice(0, 500);
+            var counts = self.errorCounts;
+            if (counts[text]) { counts[text]++; return 0; }
+            if (Object.keys(counts).length < 200) counts[text] = 1;
+            if (self.M.importErrors.length < 20) self.M.importErrors.push(text);
             self.out({ t: 'error', text: 'an import threw: ' + text });
             return 0;
         };
+        /* The module died while the import ran (it caught the trap
+         * itself): its frames must not go on. */
+        var after = function (result) {
+            if (self.dead) throw new Error('the app stopped during ' + name);
+            return result;
+        };
+        var stopped = function () { throw new Error('the app stopped before ' + name); };
         if (f.length > 8) {
             return function () {
-                try { return f.apply(null, arguments); } catch (e) { return report(e); }
+                if (self.dead) stopped();
+                var r;
+                try { r = f.apply(null, arguments); } catch (e) { return report(e); }
+                return after(r);
             };
         }
         return function (a, b, c, d, e, g, h, i) {
-            try { return f(a, b, c, d, e, g, h, i); } catch (err) { return report(err); }
+            if (self.dead) stopped();
+            var r;
+            try { r = f(a, b, c, d, e, g, h, i); } catch (err) { return report(err); }
+            return after(r);
         };
     };
 
@@ -141,7 +187,7 @@ function NshEngine(options) {
         var self = this, out = { memory: this.ex.memory };
         Object.keys(this.ex).forEach(function (name) {
             if (typeof self.ex[name] !== 'function') return;
-            out[name] = function (a, b, c, d, e, f, g, h) { return self.call(name, a, b, c, d, e, f, g, h); };
+            out[name] = function () { return self.callWith(name, arguments); };
         });
         return out;
     };

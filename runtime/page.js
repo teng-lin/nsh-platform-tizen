@@ -69,7 +69,14 @@
         window.__nsh = this.M;
         this.container = options.container || document.getElementById('app');
         this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M);
-        this.renderer.onExit = options.onExit || null;
+        /* Its components' errors are the session's (noted once, onError). */
+        this.renderer.report = function (text) { self.error(text); };
+        /* Metrics are saved before the app leaves. */
+        this.renderer.onExit = function () {
+            self.saveNow();
+            if (options.onExit) { options.onExit(); return; }
+            try { tizen.application.getCurrentApplication().exit(); } catch (e) { /* not a TV */ }
+        };
     }
 
     var S = Session.prototype;
@@ -112,9 +119,11 @@
         text = String(text).slice(0, 500);
         M.errorCounts = M.errorCounts || {};
         if (M.errorCounts[text]) { M.errorCounts[text]++; return false; }
-        M.errorCounts[text] = 1;
+        /* Counts are kept past the list's 20 (up to 200 texts), so an error
+         * that left the list is still not reported again. */
+        if (Object.keys(M.errorCounts).length < 200) M.errorCounts[text] = 1;
         M.errors.push(text);
-        if (M.errors.length > 20) delete M.errorCounts[M.errors.shift()];
+        if (M.errors.length > 20) M.errors.shift();
         this.saveMetrics();
         return true;
     };
@@ -251,7 +260,9 @@
              * down before the app, or in another page) is nobody's. */
             delete keys[code];
             if (held === 'app') return this.sendKey(e, false, code);
-            if (held === 'swallowed' || known) e.preventDefault();
+            /* The TV keyboard's keys keep their default (typing, the
+             * caret); an unknown release is left alone too. */
+            if (held === 'swallowed') e.preventDefault();
             return;
         }
         if (e.repeat && held) {
@@ -263,7 +274,7 @@
         var disposition = this.dispose(e, code, known);
         keys[code] = disposition;
         if (disposition === 'app') this.sendKey(e, true, code);
-        else if (disposition === 'swallowed' || known) e.preventDefault();
+        else if (disposition === 'swallowed') e.preventDefault();
     };
 
     /* What a fresh press is: the app's, the TV keyboard's, or swallowed
@@ -390,6 +401,7 @@
         if (this.worker) this.worker.terminate();
         if (this.engine) this.engine.halt();
         clearTimeout(this.saveTimer);
+        this.saveNow();
         this.renderer.dispose();
         this.waiting = {};
     };

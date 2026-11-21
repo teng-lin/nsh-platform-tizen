@@ -63,16 +63,21 @@ var NshTizen = (function () {
     /*
      * Whether an <img> may load `uri` (not an in-memory image's key, which
      * the renderer maps to its blob): http(s), and the package's own files
-     * by a relative URL. No other scheme: `file:` would let a playlist's
+     * by a relative URL that stays inside the package's directory. No
+     * other scheme and no path out of it: `file:` would let a playlist's
      * logo probe the TV's files, `javascript:` nothing good. Parsed as the
-     * browser parses it (leading spaces and tabs included).
+     * browser parses it (leading spaces and tabs included). `base` is the
+     * page's (tests pass another).
      */
-    function imageAllowed(uri) {
+    function imageAllowed(uri, base) {
+        base = base || document.baseURI;
         var url;
-        try { url = new URL(uri, document.baseURI); } catch (e) { return false; }
+        try { url = new URL(uri, base); } catch (e) { return false; }
         if (url.protocol === 'http:' || url.protocol === 'https:') return true;
-        /* Relative: resolved against the package's page. */
-        return !/^[\s\x00-\x1f]*[a-z][a-z0-9+.-]*:/i.test(uri) && url.protocol === new URL(document.baseURI).protocol;
+        var trimmed = String(uri).replace(/^[\s\x00-\x1f]+/, '');
+        /* A scheme, a root or a host of its own (/x, \\x, //x). */
+        if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed) || /^[\/\\]/.test(trimmed)) return false;
+        return url.href.indexOf(new URL('.', base).href) === 0;
     }
 
     /* ---------- the view tree ---------- */
@@ -145,9 +150,12 @@ var NshTizen = (function () {
     R.guard = function (n, what, f) {
         try { return f(); } catch (e) {
             var text = 'component ' + (n.comp ? n.comp.name : '?') + ' ' + what + ': ' + String(e && e.stack || e);
-            this.M.errors.push(text.slice(0, 500));
-            if (this.M.errors.length > 20) this.M.errors.shift();
-            if (typeof console !== 'undefined') console.error(text);
+            if (this.report) {
+                this.report(text);
+            } else {
+                this.M.errors.push(text.slice(0, 500));
+                if (this.M.errors.length > 20) this.M.errors.shift();
+            }
             return undefined;
         }
     };

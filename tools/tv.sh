@@ -5,11 +5,12 @@
 #   tools/tv.sh eval FILE        evaluate FILE's expression on the page
 #   tools/tv.sh shot OUT.png     screenshot
 #   tools/tv.sh bench [RUNS]     the shared benchmark in RUNS normal launches (default 2)
-# TV=host:port (default 192.168.1.157:26101), APP=NshSpike01.Guide.
+# TV=host:port is required (the TV's sdb address, port 26101 by default);
+# APP=NshSpike01.Guide.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 export PATH=$PATH:$HOME/tizen-studio/tools:$HOME/tizen-studio/tools/ide/bin
-tv="${TV:-192.168.1.157:26101}"
+tv="${TV:?set TV=host:port (the TV's sdb address)}"
 host="${tv%%:*}"
 app="${APP:-NshSpike01.Guide}"
 pkg="${app%%.*}"

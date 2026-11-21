@@ -6,12 +6,14 @@ on:
 
 jobs:
   rust:
-    name: Rust tests, clippy, fmt
+    name: Rust tests, clippy, fmt (Rust 1.99)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: a new stable's clippy lints must not turn CI red unasked.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99"
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check

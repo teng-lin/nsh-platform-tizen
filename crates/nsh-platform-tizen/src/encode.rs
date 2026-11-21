@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! The batches the engine commits, as the operations the page runtime
 //! applies (`runtime/renderer.js`): one JSON array per commit, each
 //! operation an array led by its code. Everything here is plain Rust over

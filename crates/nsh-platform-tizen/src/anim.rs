@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! NSH's native animation graph ([`Animator`]), run beside the engine: the
 //! Mini Program's frames tick it, scroll offsets feed it, and each bound
 //! view gets its animated properties as inline CSS (`["a", id, css]`),

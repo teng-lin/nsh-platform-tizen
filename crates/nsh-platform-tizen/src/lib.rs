@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! An NSH platform for Samsung Tizen TVs (Tizen 5.5 and later: Chromium 69,
 //! ES2017, MVP WebAssembly), built only on NSH's public engine API outside
 //! NSH's repository (NSH's `docs/dev/platforms.md`). It started from
@@ -692,7 +693,8 @@ impl<M: Measure + 'static> Runtime<M> {
     /// ([`Runtime::key_target`]); the page names one only for the input
     /// being edited. OK on a focused view that takes presses is a key
     /// there and, when the app's `captureKeys` did not take it, presses it.
-    /// Repeats and the release go where the press went.
+    /// Repeats go where keys go now; the release to the views the last
+    /// down reached ([`route`]).
     pub fn remote_key(
         &mut self,
         id: u32,

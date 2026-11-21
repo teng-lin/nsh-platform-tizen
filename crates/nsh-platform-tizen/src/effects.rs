@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! What CSS says of a view beyond its box: shadows, gradients, filters, the
 //! transforms, blending, transitions and keyframes. After
 //! NSH's web backend (`nsh-platform-web`'s `encode.rs`), which draws the

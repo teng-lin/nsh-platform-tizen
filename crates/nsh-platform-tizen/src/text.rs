@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! The text engine: NSH lays text out once, on the engine's side
 //! (`TextEngine`: prepare, measure at any width, lay out at the final
 //! size), and the page only draws the runs it is given. Widths come from

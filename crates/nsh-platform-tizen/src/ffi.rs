@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! The WebAssembly module's interface with the runtime
 //! (`runtime/engine.js`, in the Worker). Strings cross as a pointer and a
 //! length into this module's memory (UTF-8); JS copies them before a call

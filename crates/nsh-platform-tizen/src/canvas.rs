@@ -1,3 +1,4 @@
+// Derived from nsh-platform-miniprogram (Copyright 2026 Jason Lee, Apache-2.0); modified.
 //! Canvas drawings as JSON for the Mini Program's 2D canvas
 //! (`components/nsh-node`, `draw`): one array per operation, named after
 //! the 2D context's method or property, as NSH's web runtime draws them

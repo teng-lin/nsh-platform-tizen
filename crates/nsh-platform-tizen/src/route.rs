@@ -13,10 +13,13 @@
 //! app's `captureKeys` may take it) and, when nothing captured it, presses
 //! the view, as NSH's web backend does.
 //!
-//! Each physical key's press decides its route and its family (a key, or
-//! OK pressing a view): its repeats and release keep the family, and go to
-//! the pressed view, or where keys go now if that view left the tree. A
-//! release without a press is dropped.
+//! Each physical key's press decides its family (a key, or OK pressing a
+//! view). A key's auto-repeats go where keys go now (as NSH's web and
+//! macOS backends pick the view per event); a held OK stays on the view it
+//! pressed. The release goes to the view the last down reached or, if it
+//! left, to the nearest view that heard that down and is still there (the
+//! root's content as it was, never content that replaced it). A release
+//! without a press is dropped.
 //!
 //! The focus of views (not inputs, whose focus is the page's `<input>`) is
 //! kept here too. `Command::Focus` / `Blur` on a view, an input taking the
@@ -298,17 +301,36 @@ impl Routes {
         }
     }
 
-    /// `id` and its ancestors, nearest first.
+    /// The views a key's down on `id` reaches, nearest first: `id` and its
+    /// ancestors below the root. The root itself is left out: a key there
+    /// starts at the root's content (the core's `key_start`), so a down at
+    /// the root is recorded as reaching that content, and a release is
+    /// never sent to content that replaced it.
     fn ancestry(&self, mut id: u32) -> Vec<u32> {
+        if id == ROOT_ID {
+            return match self.root_content() {
+                Some(content) => vec![content],
+                None => vec![ROOT_ID],
+            };
+        }
         let mut out = vec![id];
         while let Some(&p) = self.parent.get(&id) {
-            if out.len() > 10_000 {
+            if p == ROOT_ID || out.len() > 10_000 {
                 break;
             }
             out.push(p);
             id = p;
         }
         out
+    }
+
+    /// The view mounted at the root, as the core's `key_start` picks it.
+    fn root_content(&self) -> Option<u32> {
+        self.children
+            .get(&ROOT_ID)?
+            .iter()
+            .copied()
+            .find(|c| !self.modals.contains(c))
     }
 
     /// The focused-state bits to report for a view going to `focused`:
@@ -506,7 +528,8 @@ mod tests {
         r.end_batch();
         focus(&mut r, 4);
         assert_eq!(r.route(13, true, false, false, 0), Route::Key(2));
-        // Its whole branch gone: the root heard it.
+        // Its whole branch gone (the root's content): nobody left heard
+        // it, so the release is dropped rather than sent to new content.
         assert_eq!(
             r.route(13, true, true, false, 0),
             Route::Key(4),
@@ -514,7 +537,22 @@ mod tests {
         );
         r.apply(&MountItem::Remove { id: 2 });
         r.end_batch();
-        assert_eq!(r.route(13, true, false, false, 0), Route::Key(ROOT_ID));
+        assert_eq!(r.route(13, true, false, false, 0), Route::Drop);
+    }
+
+    #[test]
+    fn a_release_at_the_root_is_not_sent_to_new_content() {
+        let mut r = tree();
+        // Nothing focused: the down goes to the root (its content, 2).
+        assert_eq!(r.route(13, true, true, false, 0), Route::Key(ROOT_ID));
+        // The down replaced the root's content.
+        r.apply(&MountItem::Remove { id: 2 });
+        insert(&mut r, 1, 30);
+        r.end_batch();
+        assert_eq!(r.route(13, true, false, false, 0), Route::Drop);
+        // Content unchanged: the release goes to it.
+        assert_eq!(r.route(40, false, true, false, 0), Route::Key(ROOT_ID));
+        assert_eq!(r.route(40, false, false, false, 0), Route::Key(30));
     }
 
     #[test]

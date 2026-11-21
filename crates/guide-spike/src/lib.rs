@@ -115,7 +115,9 @@ pub fn Guide() -> impl IntoElement {
                 let from = playing.get_untracked().unwrap_or(0) as isize;
                 play((from + delta).rem_euclid(count) as usize);
             }
-            "MediaPlayPause" | "MediaPause" | "MediaPlay" => paused.update(|p| *p = !*p),
+            "MediaPlayPause" => paused.update(|p| *p = !*p),
+            "MediaPause" => paused.set(true),
+            "MediaPlay" => paused.set(false),
             "MediaStop" => playing.set(None),
             "ColorF0Red" => search.focus(),
             "GoBack" => nsh_platform_tizen::host(r#"{"exit":true}"#),
@@ -491,6 +493,7 @@ fn ui_sets() -> Vec<nsh_core::element::Registry> {
 /// build.sh `NSH_APP_FONT`, `NSH_APP_FONT_FAMILY`).
 const APP_FONT_FAMILY: Option<&str> = option_env!("NSH_APP_FONT_FAMILY");
 
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 fn root() -> nsh_core::element::Root {
     let root = nsh_core::element::Root::of::<Guide>();
     #[cfg(feature = "app-font")]
@@ -509,7 +512,13 @@ mod tests {
         pumped
             .batches
             .iter()
-            .flat_map(|b| b.as_array().unwrap().clone())
+            .flat_map(|b| {
+                serde_json::from_str::<serde_json::Value>(b)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
             .collect()
     }
 
@@ -528,9 +537,10 @@ mod tests {
             .find(|op| op[0] == "e" && op[2].as_u64().unwrap() & 8 == 8)
             .map(|op| op[1].as_u64().unwrap() as u32)
             .expect("the guide listens for keys");
+        assert_eq!(rt.key_target(), listener, "keys go to the guide");
         let created = first.iter().filter(|op| op[0] == "c").count();
-        let down = ops(&rt.key(listener, "ArrowDown", "ArrowDown", true, false));
-        let right = ops(&rt.key(listener, "ArrowRight", "ArrowRight", true, false));
+        let down = ops(&rt.remote_key(0, 40, "", "", true, false));
+        let right = ops(&rt.remote_key(0, 39, "", "", true, false));
         eprintln!(
             "first render: {} ops, {} views; Down: {} ops; Right: {} ops",
             first.len(),

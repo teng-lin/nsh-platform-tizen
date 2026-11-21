@@ -269,9 +269,41 @@ node tools/page-test.mjs                 # the built package in headless Chromiu
 tools/tv.sh install|debug|eval|bench     # on the TV (TV=host:port, APP=id)
 ```
 
-The build uses Patina's pinned nightly (`../patina-iptv/tools/ci/fuzz-imports.sh
---toolchain`), with a rebuilt std, `-C target-cpu=mvp -C
-target-feature=+sign-ext,+mutable-globals`, through rustup's `cargo`. An app
+The TV build needs rustup with the nightly Patina pins (`nightly-2026-10-24`,
+`NSH_NIGHTLY` to change it) and its `rust-src` component. It rebuilds std,
+with `-C target-cpu=mvp -C target-feature=+sign-ext,+mutable-globals`. It
+also needs Tizen Studio's CLI and a signing profile. `cargo test` and the
+page test need neither.
+
+NSH comes from `teng-lin/nsh` at the commit Patina pins (the `patina`
+branch), and the test app's `iptv-core` (and, with the `ballast`
+features, `iptv-web`) from `teng-lin/patina-iptv`, both as git
+dependencies pinned by revision in `Cargo.toml`, with `Cargo.lock`
+committed. A fresh clone builds as it is.
+
+### Local checkouts
+
+To work against local checkouts of NSH or Patina, patch the git sources in
+an uncommitted `.cargo/config.toml` (it is in `.gitignore`):
+
+```toml
+[patch."https://github.com/teng-lin/nsh"]
+nsh-core = { path = "../nsh/crates/nsh-core" }
+nsh-engine = { path = "../nsh/crates/nsh-engine" }
+nsh-base = { path = "../nsh/crates/nsh-base" }
+
+[patch."https://github.com/teng-lin/patina-iptv"]
+iptv-core = { path = "../patina-iptv/crates/iptv-core" }
+iptv-web = { path = "../patina-iptv/crates/iptv-web" }
+```
+
+For a single command, use `--config`:
+
+```sh
+cargo test --config 'patch."https://github.com/teng-lin/nsh".nsh-core.path="../nsh/crates/nsh-core"'
+```
+
+A patch changes `Cargo.lock`; don't commit that change. An app
 links the platform through a runner:
 `nsh_platform_tizen::app!(nsh_rust_app::app_ui_sets(), nsh_rust_app::root());`.
 `docs/patina-integration.md` lists what Patina's `hosts/tizen` needs.

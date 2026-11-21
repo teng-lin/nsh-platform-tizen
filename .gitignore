@@ -2,3 +2,4 @@ target/
 probes/*/target/
 probes/*/app/*.wasm
 tools/node_modules/
+.cargo/config.toml

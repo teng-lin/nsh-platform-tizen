@@ -7,13 +7,15 @@
 #   NSH_PAGE=page-thread.html  start the page-thread benchmark variant
 #   NSH_BENCH=1                include the shared benchmark (nsh-bench.js)
 #   NSH_OPT=s|z|3              opt-level (default 3)
+#   NSH_NIGHTLY=...            the nightly toolchain (default: Patina's pin)
 #   NSH_FEATURES=...           guide-spike features (ballast)
 #   NSH_FONT=path.ttf          ship a font and register it from the host page ("Host Font")
 #   NSH_APP_FONT=path.ttf NSH_APP_FONT_FAMILY=name
 #                              compile a font into the app (feature app-font)
 set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
-nightly="$("$root/../patina-iptv/tools/ci/fuzz-imports.sh" --toolchain)"
+# The nightly Patina pins (its rebuilt std targets this TV generation).
+nightly="${NSH_NIGHTLY:-nightly-2026-10-24}"
 features="${NSH_FEATURES:-}"
 if [[ -n "${NSH_APP_FONT:-}" ]]; then
     export NSH_APP_FONT NSH_APP_FONT_FAMILY
@@ -33,8 +35,8 @@ sed "s|<content src=\"index.html\"/>|<content src=\"${NSH_PAGE:-index.html}\"/>|
 if [[ "${NSH_PAGE:-}" == page-thread.html ]]; then
     sed -i "s|script-src 'self';|script-src 'self' 'unsafe-eval';|" "$stage/config.xml"
 fi
-cp "$root/../patina-iptv/art/icon/play-512.png" "$stage/icon.png"
-cp "$root/../patina-iptv/art/icon/play-512.png" "$stage/assets/logo.png"
+cp "$root/app/icon.png" "$stage/icon.png"
+cp "$root/app/icon.png" "$stage/assets/logo.png"
 cp "$root/target/tizen-wasm/wasm32-unknown-unknown/release/guide_spike.wasm" "$stage/app.wasm"
 # The module's SHA-256 keys the compiled-module cache: a rebuilt module
 # never runs the old compiled code.

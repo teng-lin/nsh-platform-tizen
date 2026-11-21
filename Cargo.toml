@@ -8,13 +8,19 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# Patina's NSH pin (../nsh-patina at patina-iptv's nsh.rev), so the spike runs
-# the same engine Patina ships.
+# NSH at the commit Patina pins (the `patina` branch of teng-lin/nsh), so
+# the platform runs the same engine Patina ships. To develop against local
+# checkouts, patch these in an uncommitted `.cargo/config.toml` (README,
+# "Local checkouts").
 [workspace.dependencies]
-nsh-core = { path = "../nsh-patina/crates/nsh-core" }
-nsh-engine = { path = "../nsh-patina/crates/nsh-engine", default-features = false }
-nsh-base = { path = "../nsh-patina/crates/nsh-base", default-features = false }
-iptv-core = { path = "../patina-iptv/crates/iptv-core" }
+nsh-core = { git = "https://github.com/teng-lin/nsh", rev = "fd847c95917edbac95368ae28b7c19fe3ee01470" }
+nsh-engine = { git = "https://github.com/teng-lin/nsh", rev = "fd847c95917edbac95368ae28b7c19fe3ee01470", default-features = false }
+nsh-base = { git = "https://github.com/teng-lin/nsh", rev = "fd847c95917edbac95368ae28b7c19fe3ee01470", default-features = false }
+# The test app only (guide-spike): Patina's guide model, and with feature
+# `ballast-core` its browser adapters. The platform crate never depends on
+# Patina.
+iptv-core = { git = "https://github.com/teng-lin/patina-iptv", rev = "495fe7caebd2cd0f246d514986afffc251b6b452" }
+iptv-web = { git = "https://github.com/teng-lin/patina-iptv", rev = "495fe7caebd2cd0f246d514986afffc251b6b452" }
 log = "0.4"
 # The version nsh-core links (no extra code in the module).
 ttf-parser = "0.25"

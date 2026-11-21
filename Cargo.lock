@@ -846,6 +846,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "iptv-core"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "zeroize",
 ]
@@ -853,6 +854,7 @@ dependencies = [
 [[package]]
 name = "iptv-epg"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "flate2",
  "iptv-core",
@@ -864,6 +866,7 @@ dependencies = [
 [[package]]
 name = "iptv-guide"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "iptv-core",
  "iptv-epg",
@@ -873,6 +876,7 @@ dependencies = [
 [[package]]
 name = "iptv-import"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "flate2",
  "iptv-core",
@@ -886,6 +890,7 @@ dependencies = [
 [[package]]
 name = "iptv-library"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "iptv-core",
  "iptv-epg",
@@ -895,6 +900,7 @@ dependencies = [
 [[package]]
 name = "iptv-providers"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "iptv-core",
  "percent-encoding",
@@ -909,6 +915,7 @@ dependencies = [
 [[package]]
 name = "iptv-settings"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "serde_json",
 ]
@@ -916,6 +923,7 @@ dependencies = [
 [[package]]
 name = "iptv-web"
 version = "0.1.5"
+source = "git+https://github.com/teng-lin/patina-iptv?rev=495fe7caebd2cd0f246d514986afffc251b6b452#495fe7caebd2cd0f246d514986afffc251b6b452"
 dependencies = [
  "iptv-core",
  "iptv-epg",
@@ -1101,6 +1109,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.6.0"
+source = "git+https://github.com/teng-lin/nsh?rev=fd847c95917edbac95368ae28b7c19fe3ee01470#fd847c95917edbac95368ae28b7c19fe3ee01470"
 dependencies = [
  "chrono",
  "html5ever",
@@ -1119,6 +1128,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.6.0"
+source = "git+https://github.com/teng-lin/nsh?rev=fd847c95917edbac95368ae28b7c19fe3ee01470#fd847c95917edbac95368ae28b7c19fe3ee01470"
 dependencies = [
  "cap-std",
  "chrono",
@@ -1148,6 +1158,7 @@ dependencies = [
 [[package]]
 name = "nsh-engine"
 version = "0.6.0"
+source = "git+https://github.com/teng-lin/nsh?rev=fd847c95917edbac95368ae28b7c19fe3ee01470#fd847c95917edbac95368ae28b7c19fe3ee01470"
 dependencies = [
  "crossbeam-channel",
  "env_filter",
@@ -1165,6 +1176,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.6.0"
+source = "git+https://github.com/teng-lin/nsh?rev=fd847c95917edbac95368ae28b7c19fe3ee01470#fd847c95917edbac95368ae28b7c19fe3ee01470"
 dependencies = [
  "imagesize",
  "proc-macro2",
@@ -1188,6 +1200,7 @@ dependencies = [
 [[package]]
 name = "nsh-updater"
 version = "0.6.0"
+source = "git+https://github.com/teng-lin/nsh?rev=fd847c95917edbac95368ae28b7c19fe3ee01470#fd847c95917edbac95368ae28b7c19fe3ee01470"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",

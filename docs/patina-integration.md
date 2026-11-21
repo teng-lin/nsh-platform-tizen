@@ -164,8 +164,9 @@ Patina's `input::window` focuses its root only on long-press platforms. On
 Tizen its window view hears keys without a focus, because a key reported at
 the root starts at the app's mount root, so that works as is. Back reaches
 the app only as the raw `GoBack` key: there is no NSH back handling
-(`onBackRequest`, `onRequestClose`) behind it. OK on a focused pressable view presses it
-and isn't also delivered as a raw key.
+(`onBackRequest`, `onRequestClose`) behind it. OK on a focused pressable view
+is delivered as a key first (so `captureKeys` can take it, and ancestors
+hear it) and presses the view only when nothing captured it.
 
 ## Upstream requests (NSH)
 

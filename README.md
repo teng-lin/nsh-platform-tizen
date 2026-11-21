@@ -104,11 +104,19 @@ never touches a player it didn't open. AVPlay is one player per app: it is
 taken only when free (getState NONE), so a second instance, or anything the
 host page opened itself, reports `busy`.
 
-Samsung's `seekTo` must complete before any other AVPlay call. While a seek
-runs, every other call waits: play, pause, the rect, metadata reads, and
-the close or reopen that a zap, hide or removal asks for. They run when the
-seek completes, fails, or a 5 s watchdog gives up on it. A seek that didn't
-happen reports a timeline with `failed: true`. A stream opened paused stays
+Samsung's `seekTo` must complete before any other AVPlay call ("During this
+async operation, the other API would not be allowed ... wait for one of both
+callbacks", AVPlay API reference; `getState` is not exempted, so nothing
+polls it). While a seek runs, every other call waits: play, pause, the rect,
+metadata reads, and the close or reopen that a zap, hide or removal asks
+for. They run when the seek's callback comes. A seek without a callback
+after 5 s is reported to the app as failed (a timeline with `failed: true`)
+while the calls keep waiting; only after 30 s do they run anyway. A close
+AVPlay refuses leaves the player STUCK: it is retried every second, and an
+open that found it stuck runs once it closes. An app's seek is answered for
+its source even if a hide closed the player meanwhile, so it is not asked
+again on show, and the stream reopens where the player actually was. A zap
+queued behind a seek while the page was hidden opens on show. A stream opened paused stays
 prepared (READY) until it is unpaused; pause is only called on a stream
 that has played. It doesn't support headers, volume, mute or tracks.
 
@@ -153,17 +161,23 @@ decides where a key goes, from the tree it just committed (the page's copy
 lags a message behind): the view the app focused (`ElementRef::focus` on a
 focusable view) while it is attached. Else, with a modal open, the topmost
 attached modal's content: its first child that is not a modal, in drawing
-order. Else the root, where the core starts the key at the view mounted
-there, as NSH's own backends report a key with nothing focused. The page
+order. That is this platform's own choice: NSH's web backend reports at the
+newest modal itself and macOS at the root's content, and neither reaches a
+plain modal's content without a focus. Else the root, where the core starts
+the key at the view mounted there, as NSH's own backends report a key with
+nothing focused. The page
 names only the input being edited. The core then bubbles the key through
 its logical ancestors up to its window, so a plain modal's background hears
 what the modal's content doesn't take. That's NSH's behaviour on every
 backend, kept here; `captureKeys`, or a focus inside the modal, keeps keys
 there. OK on a focused view that takes presses is a key there first; when
 the app's `captureKeys` didn't take it, it also presses the view, as NSH's
-web backend does. A key's repeats and release keep its press's route and
-family: a press-and-release stays one, and goes where keys go now only if
-its view left the tree. A release without a press is dropped. Keys go
+web backend does. A key's auto-repeats go where keys go now (holding Down
+walks a list whose items move the focus), as NSH's web and macOS backends
+pick the view per event. A held OK on the view it pressed stays there. The
+release goes to the view its last down reached or, if that view left the
+tree, to the nearest view that heard the down and is still there, never to
+a view that heard no down. A release without a press is dropped. Keys go
 through the engine's own entry, `LocalEngine::key_event`, so
 `default_prevented` carries the app's `captureKeys` decision. That entry is
 `#[doc(hidden)]` in NSH (its web backend uses it too): this platform

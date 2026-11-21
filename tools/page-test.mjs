@@ -28,6 +28,8 @@ const API = new Set(['globalThis', 'WeakRef', 'FinalizationRegistry', 'fromEntri
     'replaceChildren', 'description']);
 // Members that are fine elsewhere but not on these objects (Promise.any).
 const MEMBERS = [['Promise', 'any']];
+// Methods newer than Chromium 69 when called (a field named `at` is fine).
+const CALLED = new Set(['at', 'toSorted', 'toReversed', 'toSpliced', 'with', 'findLast', 'flatMap']);
 const CSS = [/(^|[;{\s])gap\s*:/, /\b(min|max|clamp)\(/, /(^|[;{\s])inset\s*:/, /aspect-ratio/];
 function es2017(file, source) {
     let ast;
@@ -42,6 +44,8 @@ function es2017(file, source) {
     walk.full(ast, (node) => {
         if (node.type === 'Identifier' && API.has(node.name)) used.add(node.name);
         if (node.type === 'MemberExpression' && !node.computed && API.has(node.property.name)) used.add(node.property.name);
+        if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' && !node.callee.computed
+            && CALLED.has(node.callee.property.name)) used.add(`.${node.callee.property.name}()`);
         if (node.type === 'MemberExpression' && !node.computed && node.object.type === 'Identifier'
             && MEMBERS.some(([o, p]) => o === node.object.name && p === node.property.name)) used.add(`${node.object.name}.${node.property.name}`);
         if (node.type === 'Literal' && typeof node.value === 'string') CSS.forEach((r) => { if (r.test(node.value)) css.add(String(r)); });
@@ -180,17 +184,37 @@ for (const file of ['index.html', 'page-thread.html']) {
     check(await p.until('document.activeElement.tagName !== "INPUT"', 3000), 'Done (65376) blurs the input');
     await new Promise((r) => setTimeout(r, 300));
     check((await p.evaluate(label)).indexOf('OK plays') >= 0, 'and plays nothing');
+    // Every key message the page sends the engine, counted from here.
+    await p.evaluate('(function () { var s = NshTizen.session(); window.__sentKeys = []; var send = s.send; s.send = function (m) { if (m.t === "key") window.__sentKeys.push((m.down ? "down " : "up ") + m.keyCode); return send.call(s, m); }; return 1; })()');
+    const sentKeys = 'window.__sentKeys.length';
     // A release whose press the page never saw reaches no app.
-    const k00 = await p.evaluate('NshTizen.metrics.keys.length');
+    const k00 = await p.evaluate(sentKeys);
     await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
     await new Promise((r) => setTimeout(r, 300));
-    check((await p.evaluate(label)).indexOf('OK plays') >= 0 && await p.evaluate('NshTizen.metrics.keys.length') === k00, 'an orphan release does nothing');
+    check(await p.evaluate(sentKeys) === k00, 'an orphan release sends nothing (' + k00 + ' → ' + await p.evaluate(sentKeys) + ')');
+
+    // Typing on the TV keyboard: a digit types, an arrow moves the caret
+    // (their defaults are the keyboard's), and nothing reaches the app.
+    await p.key(403);
+    await p.until('document.activeElement.tagName === "INPUT"', 3000);
+    await p.evaluate('document.activeElement.value = "ab"; document.activeElement.setSelectionRange(2, 2); 1');
+    const k01 = await p.evaluate(sentKeys);
+    await p.call('Input.dispatchKeyEvent', { type: 'keyDown', windowsVirtualKeyCode: 53, nativeVirtualKeyCode: 53, key: '5', code: 'Digit5', text: '5' });
+    await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 53, nativeVirtualKeyCode: 53, key: '5', code: 'Digit5' });
+    check(await p.until('document.activeElement.value === "ab5"', 2000), 'a digit types: ' + await p.evaluate('document.activeElement.value'));
+    const caret = await p.evaluate('document.activeElement.setSelectionRange(3, 3), document.activeElement.selectionStart');
+    await p.call('Input.dispatchKeyEvent', { type: 'rawKeyDown', windowsVirtualKeyCode: 37, nativeVirtualKeyCode: 37, key: 'ArrowLeft', code: 'ArrowLeft' });
+    await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 37, nativeVirtualKeyCode: 37, key: 'ArrowLeft', code: 'ArrowLeft' });
+    const moved = await p.evaluate('document.activeElement.selectionStart');
+    check(caret > 0 && moved === caret - 1, `an arrow moves the caret (${caret} → ${moved})`);
+    check(await p.evaluate(sentKeys) === k01, 'and neither reached the app');
+    await p.key(65385);
+    await p.until('document.activeElement.tagName !== "INPUT"', 3000);
 
     // Keys the input consumed reach no app: Done submits without playing,
     // Back leaves the input and is not a Back for the app.
     await p.key(413);
     await p.until(label + '.indexOf("OK plays") >= 0', 3000);
-    const sentKeys = 'NshTizen.metrics.keys.length';
     await p.key(403);
     await p.until('document.activeElement.tagName === "INPUT"', 3000);
     await new Promise((r) => setTimeout(r, 300));
@@ -198,6 +222,7 @@ for (const file of ['index.html', 'page-thread.html']) {
     await p.key(13);
     await new Promise((r) => setTimeout(r, 500));
     check((await p.evaluate(label)).indexOf('OK plays') >= 0, 'Done in the input plays nothing: ' + await p.evaluate(label));
+    check(await p.evaluate(sentKeys) === k0, 'and sends nothing, its release neither (' + k0 + ' → ' + await p.evaluate(sentKeys) + ')');
     await p.key(403);
     await p.until('document.activeElement.tagName === "INPUT"', 3000);
     await new Promise((r) => setTimeout(r, 300));
@@ -206,14 +231,14 @@ for (const file of ['index.html', 'page-thread.html']) {
     await new Promise((r) => setTimeout(r, 500));
     check(await p.evaluate('document.activeElement.tagName !== "INPUT"'), 'Back left the input');
     check(await p.evaluate(sentKeys) === k1, 'and reached no app (' + k1 + ' → ' + await p.evaluate(sentKeys) + ')');
-    check(k1 === k0 + 1, 'Done and its release sent nothing (Red did: ' + k0 + ' → ' + k1 + ')');
+    check(k1 === k0 + 2, 'Red sent its press and release (' + k0 + ' → ' + k1 + ')');
     // A bounced Back is one Back.
     await new Promise((r) => setTimeout(r, 700));
     const k2 = await p.evaluate(sentKeys);
     await p.key(10009);
     await p.key(10009);
     await new Promise((r) => setTimeout(r, 500));
-    check(await p.evaluate(sentKeys) === k2 + 1, 'two Backs within the debounce are one (' + k2 + ' → ' + await p.evaluate(sentKeys) + ')');
+    check(await p.evaluate(sentKeys) === k2 + 2, 'two Backs within the debounce are one press and release (' + k2 + ' → ' + await p.evaluate(sentKeys) + ')');
 
     // The runtime's own cases (components, images, the AVPlay example).
     const cases = await p.evaluate(fs.readFileSync(path.join(root, 'tools/runtime-cases.js'), 'utf8'));

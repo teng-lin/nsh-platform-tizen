@@ -118,6 +118,11 @@
         for (var k = 0; k < 25; k++) { bad('k' + k); bad('k' + k); }
         var posted = out2.filter(function (m) { return m.t === 'error'; }).length;
         check(posted === 26, 'each distinct import error posted once (' + posted + ')');
+        var counted = e2.M.importErrorCounts[('host.g: Error: same' + long).slice(0, 500)];
+        check(counted === 3, 'and counted in the metrics the page gets (' + counted + ')');
+        for (var o = 0; o < 210; o++) bad('o' + o);
+        var after = out2.filter(function (m) { return m.t === 'error'; }).length;
+        check(after === 200 && e2.M.importErrorOverflow === 36, 'past 200 texts: one overflow count, no report (' + after + ', ' + e2.M.importErrorOverflow + ')');
         /* Wrapped exports pass every argument. */
         var got = null;
         var e3 = new NshEngine({ out: function () {}, measure: null });
@@ -151,7 +156,10 @@
         }
         f.api = {
             open: rec('open', function () { f.state = 'IDLE'; }),
-            close: rec('close', function () { f.state = 'NONE'; }),
+            close: rec('close', function () {
+                if (f.closeFails > 0) { f.closeFails--; throw new Error('close refused'); }
+                f.state = 'NONE';
+            }),
             stop: rec('stop', function () { if (f.state !== 'NONE') f.state = 'IDLE'; }),
             pause: rec('pause', function () {
                 if (f.state !== 'PLAYING' && f.state !== 'PAUSED') { f.misuse.push('pause in ' + f.state); throw new Error('pause in ' + f.state); }
@@ -170,7 +178,7 @@
                 f.calls.push('seekTo ' + ms);
                 refuse('seekTo');
                 f.seeking = true;
-                if (f.seekHangs) return;
+                if (f.seekHangs) { f.hanging = { ok: function () { f.seeking = false; ok(); }, fail: function () { f.seeking = false; fail(); } }; return; }
                 setTimeout(function () { f.seeking = false; if (f.seekFails) fail(); else ok(); }, 20);
             },
             getState: function () { return f.state; },
@@ -341,12 +349,14 @@
         r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 8 } }, []]]);
         f.prepared.ok();
         r.apply([['np', 50, { seek: { token: 8, id: 1, ms: 7000 } }, []]]);
+        /* Where the fake's seek takes it. */
+        f.time = 7000;
         f.calls = [];
         hidden = true;
         document.dispatchEvent(new Event('visibilitychange'));
         check(f.calls.length === 0, 'hidden mid-seek: nothing yet (' + f.calls.join(',') + ')');
         return wait(60).then(function () {
-            check(f.calls.join(',') === 'stop,close', 'closed once the seek ended: ' + f.calls.join(','));
+            check(f.calls.join(',') === 'getCurrentTime,stop,close', 'its position read and closed once the seek ended: ' + f.calls.join(','));
             f.calls = [];
             hidden = false;
             document.dispatchEvent(new Event('visibilitychange'));
@@ -374,8 +384,9 @@
     });
 
     withFakeAsync(function (f, r, events) {
-        /* A failed seek tells the app; a seek that never answers is ended
-         * by the watchdog and the player works on. */
+        /* A failed seek tells the app. A seek that never answers is
+         * reported failed by the watchdog, but nothing calls AVPlay until
+         * its late callback: then what waited runs. */
         r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 10 } }, []]]);
         f.prepared.ok();
         f.seekFails = true;
@@ -389,13 +400,100 @@
             return wait(120);
         }).then(function () {
             NshTizen.avplay.seekTimeoutMs = 5000;
-            f.seeking = false;
             var n = events().filter(function (e) { return e.indexOf('"failed":true') >= 0; }).length;
-            check(n === 2, 'the watchdog ends a seek that never answers (' + n + ' failed)');
+            check(n === 2, 'the watchdog reports a seek that never answers (' + n + ' failed)');
             f.calls = [];
-            r.apply([['np', 50, { paused: true }, []]]);
-            check(f.calls.indexOf('pause') >= 0, 'and the player answers again: ' + f.calls.join(','));
+            r.apply([['np', 50, { paused: true }, []], ['np', 50, { source: { url: 'https://x.test/z.m3u8', token: 11 } }, []]]);
+            check(f.calls.length === 0 && f.misuse.length === 0, 'after the watchdog AVPlay still waits for the seek: ' + f.calls.join(',') + ' / ' + f.misuse.join(','));
+            f.seekHangs = false;
+            f.hanging.ok();
+            check(f.calls.slice(0, 3).join(',') === 'stop,close,open' && f.misuse.length === 0, 'the late callback lets the zap run: ' + f.calls.join(','));
+            return Promise.resolve();
         });
+    });
+
+    withFakeAsync(function (f, r, events) {
+        /* A zap queued behind a seek, then a hide: opened only on show. */
+        var hidden = false;
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hidden; } });
+        var restore = function () { delete document.hidden; };
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 12 } }, []]]);
+        f.prepared.ok();
+        r.apply([['np', 50, { seek: { token: 12, id: 1, ms: 1000 } }, []]]);
+        r.apply([['np', 50, { source: { url: 'https://x.test/b.m3u8', token: 13 } }, []]]);
+        hidden = true;
+        document.dispatchEvent(new Event('visibilitychange'));
+        f.calls = [];
+        return wait(60).then(function () {
+            check(f.calls.indexOf('open') < 0, 'nothing opened while hidden: ' + f.calls.join(','));
+            hidden = false;
+            document.dispatchEvent(new Event('visibilitychange'));
+            check(f.calls.indexOf('open') >= 0, 'opened on show: ' + f.calls.join(','));
+            restore();
+        }, function (e) { restore(); throw e; });
+    });
+
+    withFakeAsync(function (f, r, events) {
+        /* Hidden during the app's seek: the seek is answered (not asked
+         * again on show), and the stream reopens where the player was
+         * after it. */
+        var hidden = false;
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hidden; } });
+        var restore = function () { delete document.hidden; };
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 14 }, seek: { token: 14, id: 5, ms: 8000 } }, []]]);
+        f.prepared.ok();
+        hidden = true;
+        f.time = 8100;
+        document.dispatchEvent(new Event('visibilitychange'));
+        return wait(60).then(function () {
+            check(events().some(function (e) { return e.indexOf('timeline') === 0 && e.indexOf('"seekId":5') >= 0; }), 'the seek is answered though hidden');
+            f.calls = [];
+            hidden = false;
+            document.dispatchEvent(new Event('visibilitychange'));
+            f.prepared.ok();
+            return wait(60);
+        }).then(function () {
+            restore();
+            var seeks = f.calls.filter(function (c) { return c.indexOf('seekTo') === 0; });
+            check(seeks.join(',') === 'seekTo 8100', 'reopened at the player\'s position, the seek not repeated: ' + seeks.join(','));
+            check(f.misuse.length === 0, 'no refused call: ' + f.misuse.join(','));
+        }, function (e) { restore(); throw e; });
+    });
+
+    withFakeAsync(function (f, r, events, sent) {
+        /* A close AVPlay refuses: the player is retried, and a zap that
+         * found it stuck opens once it closes. */
+        NshTizen.avplay.stuckRetryMs = 20;
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 15 } }, []]]);
+        f.prepared.ok();
+        f.closeFails = 1;
+        r.apply([['np', 50, { source: null }, []]]);
+        f.calls = [];
+        var sent2 = [];
+        var r2 = renderer(sent2);
+        r2.apply(mount.concat([['n', 50, 'test.avplay'], ['np', 50, { source: { url: 'https://x.test/b.m3u8', token: 1 } }, []]]));
+        return wait(100).then(function () {
+            NshTizen.avplay.stuckRetryMs = 1000;
+            check(f.calls.indexOf('open') >= 0, 'opened once the stuck player closed: ' + f.calls.join(','));
+            check(!sent2.some(function (m) { return m.t === 'native' && m.data.indexOf('busy') >= 0; }), 'without busy');
+            r2.dispose();
+        });
+    });
+
+    /* A held OK that focused an input stays the app's: its repeats in the
+     * input do not turn it into a swallowed key, so its release is sent. */
+    later.push(function () {
+        var r = renderer([]);
+        r.apply([['c', 70, 'input'], ['i', 1, 70, null], ['in', 70, { css: '', ph: '', type: 'text', ml: false, max: -1, off: false, submit: 'blur', auto: false }]]);
+        r.keys[13] = 'app';
+        var el = r.nodes[70].input.el;
+        el.focus();
+        var e = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, repeat: true });
+        Object.defineProperty(e, 'keyCode', { get: function () { return 13; } });
+        el.dispatchEvent(e);
+        check(r.keys[13] === 'app', 'a repeat in the input keeps the press\'s disposition: ' + r.keys[13]);
+        r.dispose();
+        return Promise.resolve();
     });
 
     later.push(function () {

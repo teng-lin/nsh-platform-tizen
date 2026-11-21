@@ -253,8 +253,10 @@ for (const file of ['index.html', 'page-thread.html']) {
     p.ws.close();
 }
 
+const exited = new Promise((ok) => chrome.once('exit', ok));
 chrome.kill();
+await Promise.race([exited, new Promise((ok) => setTimeout(ok, 5000))]);
 server.close();
-fs.rmSync(profile, { recursive: true, force: true });
+fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 console.log(failures ? `${failures} failed` : 'all passed');
 process.exit(failures ? 1 : 0);

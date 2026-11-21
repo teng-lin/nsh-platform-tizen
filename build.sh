@@ -2,7 +2,8 @@
 # Builds the guide app for Tizen 5.5 (MVP WebAssembly + sign-extension +
 # mutable globals, a rebuilt std on the pinned nightly) and signs a .wgt.
 # --install HOST:PORT also installs it. Needs TIZEN_SIGNING_PROFILE and
-# Tizen Studio's CLI.
+# Tizen Studio's CLI; --stage only builds target/stage (no signing, no
+# Tizen Studio: what CI and the page test need).
 #
 #   NSH_PAGE=page-thread.html  start the page-thread benchmark variant
 #   NSH_BENCH=1                include the shared benchmark (nsh-bench.js)
@@ -53,6 +54,9 @@ else
     rm "$stage/nsh-bench.js"
 fi
 ls -la "$stage/app.wasm"
+if [[ "${1:-}" == "--stage" ]]; then
+    exit 0
+fi
 tizen="$(command -v tizen || echo "$HOME/tizen-studio/tools/ide/bin/tizen")"
 "$tizen" package -t wgt -s "${TIZEN_SIGNING_PROFILE:?set TIZEN_SIGNING_PROFILE}" -- "$stage" >/dev/null
 mv "$stage"/*.wgt "$root/target/guide.wgt"

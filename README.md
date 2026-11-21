@@ -265,7 +265,8 @@ TIZEN_SIGNING_PROFILE=<profile> ./build.sh [--install <tv-ip>:26101]
 #   NSH_OPT=s|z|3  NSH_FEATURES=ballast  NSH_FONT=x.ttf  NSH_APP_FONT=x.ttf NSH_APP_FONT_FAMILY=name
 cargo test                               # encoding, keys, routing, fonts, components, inputs, images
 (cd tools && npm ci)                     # acorn, for the ES2017 check (tools only)
-node tools/page-test.mjs                 # the built package in headless Chromium (after build.sh)
+./build.sh --stage                       # the package's files only (no Tizen Studio, no signing)
+node tools/page-test.mjs [browser]       # the built package in headless Chromium (default: chromium)
 tools/tv.sh install|debug|eval|bench     # on the TV (TV=host:port, APP=id)
 ```
 
@@ -303,7 +304,14 @@ For a single command, use `--config`:
 cargo test --config 'patch."https://github.com/teng-lin/nsh".nsh-core.path="../nsh/crates/nsh-core"'
 ```
 
-A patch changes `Cargo.lock`; don't commit that change. An app
+A patch changes `Cargo.lock`; don't commit that change.
+
+### CI
+
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy -D
+warnings` and `cargo test` on stable, then builds the package with
+`./build.sh --stage` on the pinned nightly and runs the page test in the
+runner's preinstalled Chrome. Nothing in CI touches a TV. An app
 links the platform through a runner:
 `nsh_platform_tizen::app!(nsh_rust_app::app_ui_sets(), nsh_rust_app::root());`.
 `docs/patina-integration.md` lists what Patina's `hosts/tizen` needs.

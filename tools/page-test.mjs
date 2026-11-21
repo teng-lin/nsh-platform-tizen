@@ -24,7 +24,10 @@ const check = (ok, what) => { console.log(`${ok ? 'ok  ' : 'FAIL'} ${what}`); if
 const acorn = await import('acorn');
 const walk = await import('acorn-walk');
 const API = new Set(['globalThis', 'WeakRef', 'FinalizationRegistry', 'fromEntries', 'allSettled', 'matchAll', 'replaceAll',
-    'queueMicrotask', 'structuredClone', 'BigInt', 'hasOwn', 'findLast', 'findLastIndex', 'instantiateStreaming', 'compileStreaming']);
+    'queueMicrotask', 'structuredClone', 'BigInt', 'hasOwn', 'findLast', 'findLastIndex', 'instantiateStreaming', 'compileStreaming',
+    'replaceChildren', 'description']);
+// Members that are fine elsewhere but not on these objects (Promise.any).
+const MEMBERS = [['Promise', 'any']];
 const CSS = [/(^|[;{\s])gap\s*:/, /\b(min|max|clamp)\(/, /(^|[;{\s])inset\s*:/, /aspect-ratio/];
 function es2017(file, source) {
     let ast;
@@ -39,23 +42,48 @@ function es2017(file, source) {
     walk.full(ast, (node) => {
         if (node.type === 'Identifier' && API.has(node.name)) used.add(node.name);
         if (node.type === 'MemberExpression' && !node.computed && API.has(node.property.name)) used.add(node.property.name);
+        if (node.type === 'MemberExpression' && !node.computed && node.object.type === 'Identifier'
+            && MEMBERS.some(([o, p]) => o === node.object.name && p === node.property.name)) used.add(`${node.object.name}.${node.property.name}`);
         if (node.type === 'Literal' && typeof node.value === 'string') CSS.forEach((r) => { if (r.test(node.value)) css.add(String(r)); });
     });
     check(used.size === 0 && css.size === 0, `${file} is ES2017 and uses no newer API or CSS ${[...used, ...css].join(' ')}`);
 }
-for (const f of fs.readdirSync(stage).filter((f) => f.endsWith('.js'))) es2017(f, fs.readFileSync(path.join(stage, f), 'utf8'));
-for (const f of fs.readdirSync(stage).filter((f) => f.endsWith('.html'))) {
-    const html = fs.readFileSync(path.join(stage, f), 'utf8');
-    const inline = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)];
-    check(inline.length === 0, `${f} has no inline script (the CSP allows none)`);
-    inline.forEach((m, i) => es2017(`${f} inline ${i}`, m[1]));
+function files(dir) {
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? files(path.join(dir, e.name)) : [path.join(dir, e.name)]);
 }
+function css(file, text) {
+    const bad = CSS.filter((r) => r.test(text));
+    check(bad.length === 0, `${file} has no CSS Chromium 69 cannot read ${bad.join(' ')}`);
+}
+for (const file of files(stage)) {
+    const name = path.relative(stage, file);
+    if (file.endsWith('.js')) es2017(name, fs.readFileSync(file, 'utf8'));
+    if (file.endsWith('.css')) css(name, fs.readFileSync(file, 'utf8'));
+    if (!file.endsWith('.html')) continue;
+    const html = fs.readFileSync(file, 'utf8');
+    const inline = [...html.matchAll(/<script\b(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script\s*>/gi)];
+    check(inline.length === 0, `${name} has no inline script (the CSP allows none)`);
+    inline.forEach((m, i) => es2017(`${name} inline ${i}`, m[1]));
+    check(!/<[a-z][^>]*\son[a-z]+\s*=/i.test(html), `${name} has no inline event handler`);
+    [...html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi)].forEach((m) => css(`${name} <style>`, m[1]));
+}
+
+// The package's own policy (config.xml), served as the page's CSP header,
+// with 'unsafe-eval' for the page-thread page as build.sh gives it.
+const policy = /<tizen:content-security-policy>([^<]*)</.exec(fs.readFileSync(path.join(stage, 'config.xml'), 'utf8'));
+check(!!policy, 'config.xml declares a CSP');
+const csp = (file) => {
+    if (!policy) return null;
+    return file === 'page-thread.html' ? policy[1].replace("script-src 'self';", "script-src 'self' 'unsafe-eval';") : policy[1];
+};
 
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm', '.png': 'image/png', '.ttf': 'font/ttf' };
 const server = http.createServer((req, res) => {
     const file = path.join(stage, decodeURIComponent(req.url.split('?')[0]));
     if (!file.startsWith(stage) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) { res.writeHead(404); res.end(); return; }
-    res.writeHead(200, { 'content-type': types[path.extname(file)] || 'application/octet-stream' });
+    const headers = { 'content-type': types[path.extname(file)] || 'application/octet-stream' };
+    if (file.endsWith('.html') && csp(path.basename(file))) headers['content-security-policy'] = csp(path.basename(file));
+    res.writeHead(200, headers);
     fs.createReadStream(file).pipe(res);
 });
 await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
@@ -101,6 +129,8 @@ const text = 'Array.prototype.map.call(document.querySelectorAll("#app span"), f
 for (const file of ['index.html', 'page-thread.html']) {
     console.log(`# ${file}`);
     const p = await page();
+    await p.call('Page.addScriptToEvaluateOnNewDocument', { source: 'window.__cspViolations = []; document.addEventListener("securitypolicyviolation", function (e) { window.__cspViolations.push(e.violatedDirective + " " + e.blockedURI); });' });
+    await p.call('Page.enable');
     await p.call('Page.navigate', { url: `${base}/${file}` });
     check(await p.until('window.__nsh && window.__nsh.firstPaintAt > 0'), 'first render painted');
     const m = await p.evaluate('JSON.stringify({ mode: __nsh.mode, views: __nsh.views, unknown: __nsh.unknown, comps: __nsh.unknownComponents, errors: __nsh.errors, keys: Object.keys(NshTizen.renderer.nodes).length })');
@@ -140,6 +170,22 @@ for (const file of ['index.html', 'page-thread.html']) {
     await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 40, nativeVirtualKeyCode: 40 });
     check(await p.until(label + '.indexOf("Channel 3") >= 0', 5000), 'Down then OK at once plays the channel moved to: ' + await p.evaluate(label));
 
+    // The TV keyboard's Done (65376) itself submits without playing.
+    await p.key(413);
+    await p.until(label + '.indexOf("OK plays") >= 0', 3000);
+    await p.key(403);
+    await p.until('document.activeElement.tagName === "INPUT"', 3000);
+    await p.call('Input.insertText', { text: 'x' });
+    await p.key(65376);
+    check(await p.until('document.activeElement.tagName !== "INPUT"', 3000), 'Done (65376) blurs the input');
+    await new Promise((r) => setTimeout(r, 300));
+    check((await p.evaluate(label)).indexOf('OK plays') >= 0, 'and plays nothing');
+    // A release whose press the page never saw reaches no app.
+    const k00 = await p.evaluate('NshTizen.metrics.keys.length');
+    await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 });
+    await new Promise((r) => setTimeout(r, 300));
+    check((await p.evaluate(label)).indexOf('OK plays') >= 0 && await p.evaluate('NshTizen.metrics.keys.length') === k00, 'an orphan release does nothing');
+
     // Keys the input consumed reach no app: Done submits without playing,
     // Back leaves the input and is not a Back for the app.
     await p.key(413);
@@ -171,6 +217,8 @@ for (const file of ['index.html', 'page-thread.html']) {
 
     // The runtime's own cases (components, images, the AVPlay example).
     const cases = await p.evaluate(fs.readFileSync(path.join(root, 'tools/runtime-cases.js'), 'utf8'));
+    const violations = await p.evaluate('window.__cspViolations || []');
+    check(violations.length === 0, `no CSP violations ${JSON.stringify(violations)}`);
     for (const [ok, what] of cases || [[false, 'runtime cases ran']]) check(ok, what);
 
     // A second start replaces the first: one app on the page.

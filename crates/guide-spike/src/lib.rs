@@ -513,7 +513,7 @@ mod tests {
             .batches
             .iter()
             .flat_map(|b| {
-                serde_json::from_str::<serde_json::Value>(b)
+                serde_json::from_str::<serde_json::Value>(&b.json)
                     .unwrap()
                     .as_array()
                     .unwrap()
@@ -537,7 +537,11 @@ mod tests {
             .find(|op| op[0] == "e" && op[2].as_u64().unwrap() & 8 == 8)
             .map(|op| op[1].as_u64().unwrap() as u32)
             .expect("the guide listens for keys");
-        assert_eq!(rt.key_target(), listener, "keys go to the guide");
+        // Nothing focused: keys are reported at the root and start at the
+        // guide mounted there (the core's key_start), as on NSH's own
+        // backends.
+        assert_eq!(rt.key_target(), nsh_core::ROOT_ID);
+        let _ = listener;
         let created = first.iter().filter(|op| op[0] == "c").count();
         let down = ops(&rt.remote_key(0, 40, "", "", true, false));
         let right = ops(&rt.remote_key(0, 39, "", "", true, false));

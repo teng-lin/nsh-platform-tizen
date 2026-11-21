@@ -1,6 +1,7 @@
-nsh-platform-tizen (spike)
+nsh-platform-tizen
 
 The backend in crates/nsh-platform-tizen starts from nsh-platform-miniprogram
 (https://github.com/huacnlee/nsh-platform-miniprogram, commit 7bb46ef),
 Copyright 2026 Jason Lee, licensed under the Apache License 2.0 (LICENSE).
-Changes: renamed, Samsung Tizen TV environment, remote keys, a DOM renderer.
+Changes: renamed, Samsung Tizen TV environment, remote keys, a DOM renderer
+in a Worker, native components, inputs, images and fonts.

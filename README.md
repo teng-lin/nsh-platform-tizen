@@ -309,7 +309,7 @@ A patch changes `Cargo.lock`; don't commit that change.
 ### CI
 
 `.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy -D
-warnings` and `cargo test` on stable, then builds the package with
+warnings` and `cargo test` on Rust 1.99 (pinned), then builds the package with
 `./build.sh --stage` on the pinned nightly and runs the page test in the
 runner's preinstalled Chrome. Nothing in CI touches a TV. An app
 links the platform through a runner:
@@ -433,6 +433,10 @@ file size, so a 12 MB module would need about 31 MB of the 88 MB quota.
 
 ## Spike measurements (before this platform)
 
+Historical: measured with the spike at commit ee21fe2, whose files and
+settings these sections name as they were then (some no longer exist).
+Today's layout and measurements are above.
+
 ### Round 1: the engine through a DOM renderer
 
 Module: NSH engine, core and the spike app, 4.55 MB (`opt-level=3`, LTO),
@@ -509,12 +513,13 @@ linking only the base components it uses would reduce it.
 
 ### Round 3: page thread or Worker
 
-`worker.html` runs the engine and app in a Web Worker (`runtime/worker.js`,
-text measured with `OffscreenCanvas`); the page (`runtime/page-worker.js`)
-draws operations, plays video and forwards keys. Both variants run the same
-benchmark (`runtime/bench-common.js`, appended by `build.sh`; select with
-`SPIKE_PAGE=worker.html`): 32 paced moves idle, then 32 while the app's
-thread works 30 ms of every 50, with video playing.
+The spike's `worker.html` ran the engine and app in a Web Worker (text
+measured with `OffscreenCanvas`) and its page drew operations, played
+video and forwarded keys; both variants ran the same benchmark (then
+`runtime/bench-common.js`, today `runtime/bench.js`): 32 paced moves idle,
+then 32 while the app's thread works 30 ms of every 50, with video
+playing. Today the Worker variant is `index.html` and the page-thread one
+`page-thread.html` (`NSH_PAGE`).
 
 | | Key to frame idle (p50 / p90) | Under load | Page frames over 50 ms (idle / load) |
 |---|---|---|---|
@@ -522,8 +527,7 @@ thread works 30 ms of every 50, with video playing.
 | Worker | 81 / 109–184 ms | 93–94 / 130–155 ms | 5–12 / 3–10 |
 
 The Worker costs about 11 ms per key idle and wins under load; the page
-stays smooth. Patina's plan (`docs/plans/2026-11-21-browser-tv-architecture.md`)
-adopts it.
+stays smooth. Patina's browser-TV architecture plan adopts it.
 
 ## License
 

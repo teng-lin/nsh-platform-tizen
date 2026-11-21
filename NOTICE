@@ -10,5 +10,10 @@ The backend in crates/nsh-platform-tizen (in particular its encoding, text,
 canvas, effects, animation and FFI modules) started from that project's
 crates/nsh-platform-miniprogram. Changes: renamed; a Samsung Tizen TV
 environment; remote keys and their routing; a DOM renderer run from a Web
-Worker; native components; inputs, images and fonts; and the page runtime
-in runtime/, which was written for this project.
+Worker; native components; inputs, images and fonts. Those files say so
+in their first line.
+
+The page runtime in runtime/ follows the design of that project's runtime
+(runtime/nsh/nsh-mp.js: the module's imports and how strings cross into
+it; runtime/nsh/tree.js: applying operations to a tree), rewritten for a
+browser page and a Web Worker rather than copied.

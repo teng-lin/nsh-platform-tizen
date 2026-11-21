@@ -2,18 +2,18 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>NSH guide spike</title>
+<title>NSH guide</title>
 <script src="$WEBAPIS/webapis/webapis.js"></script>
 <style>
-html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent;
-  font-family: "SamsungOne", "Tizen Sans", sans-serif; }
-#player { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
+/* Transparent down to the body: AVPlay's video plane is under the page. */
+html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: transparent; }
 #app { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; }
 </style>
 </head>
 <body>
-<object id="player" type="application/avplayer"></object>
+<object id="player" type="application/avplayer" style="position:absolute;left:0;top:0;width:1920px;height:1080px"></object>
 <div id="app"></div>
-<script src="nsh-tz.js"></script>
+<script src="nsh-tizen.js"></script>
+<script src="host.js"></script>
 </body>
 </html>

@@ -100,9 +100,17 @@ An unknown name leaves the container empty and is counted in
 (`open`, buffering timeout, rect, listener, `prepareAsync`, rect again,
 `play`). It closes the player after every error, drops stale callbacks by
 token, stops while the page is hidden and reopens when it is shown, and
-never touches a player it didn't open. AVPlay is one player per app: a
-second instance reports `busy`. It doesn't support headers, volume, mute or
-tracks.
+never touches a player it didn't open. AVPlay is one player per app: it is
+taken only when free (getState NONE), so a second instance, or anything the
+host page opened itself, reports `busy`.
+
+Samsung's `seekTo` must complete before any other AVPlay call. While a seek
+runs, every other call waits: play, pause, the rect, metadata reads, and
+the close or reopen that a zap, hide or removal asks for. They run when the
+seek completes, fails, or a 5 s watchdog gives up on it. A seek that didn't
+happen reports a timeline with `failed: true`. A stream opened paused stays
+prepared (READY) until it is unpaused; pause is only called on a stream
+that has played. It doesn't support headers, volume, mute or tracks.
 
 **Host services** (storage, fetch, entropy) aren't the platform's. The
 app's imports for them run in the Worker: a script in `options.scripts`
@@ -143,27 +151,38 @@ resolves every family name, `serif` and `monospace` included, to one font.
 keys, `Info`, `Guide`, `ChannelList`, `MediaLast`, digits). The engine
 decides where a key goes, from the tree it just committed (the page's copy
 lags a message behind): the view the app focused (`ElementRef::focus` on a
-focusable view) while it is attached, else the topmost attached modal's
-root, else the root, where the core starts it at the view mounted there and
-bubbles it, as NSH's own backends report a key with nothing focused. The
-page names only the input being edited. OK on a focused view that takes
-presses presses it, without also arriving as a key. A key's repeats and
-release go where its press went (a release whose view left the tree goes
-where keys go now; one without a press is dropped). Keys go through the
-engine's own entry (`LocalEngine::key_event`), so `default_prevented`
-carries the app's `captureKeys` decision.
+focusable view) while it is attached. Else, with a modal open, the topmost
+attached modal's content: its first child that is not a modal, in drawing
+order. Else the root, where the core starts the key at the view mounted
+there, as NSH's own backends report a key with nothing focused. The page
+names only the input being edited. The core then bubbles the key through
+its logical ancestors up to its window, so a plain modal's background hears
+what the modal's content doesn't take. That's NSH's behaviour on every
+backend, kept here; `captureKeys`, or a focus inside the modal, keeps keys
+there. OK on a focused view that takes presses is a key there first; when
+the app's `captureKeys` didn't take it, it also presses the view, as NSH's
+web backend does. A key's repeats and release keep its press's route and
+family: a press-and-release stays one, and goes where keys go now only if
+its view left the tree. A release without a press is dropped. Keys go
+through the engine's own entry, `LocalEngine::key_event`, so
+`default_prevented` carries the app's `captureKeys` decision. That entry is
+`#[doc(hidden)]` in NSH (its web backend uses it too): this platform
+depends on a hidden entry point, listed as an upstream request in
+`docs/patina-integration.md`.
 
 The engine also reports the views' own `Focus` and `Blur`, each with the
 focused state (always: the core tracks it for every view). An input taking
-the DOM focus takes it from the focused view (the view's Blur first), a
-view taking the focus closes the TV keyboard, a Blur on the root blurs the
-input being edited, and a focused view that leaves the tree is blurred.
+the DOM focus takes it from the focused view (the view's Blur first). A
+view taking the focus closes the TV keyboard, and the input's Blur is
+reported before the view's Focus. A Blur on the root blurs the input being
+edited, and a focused view that leaves the tree is blurred.
 
 On the page each physical key's press decides what it is: the app's, the
 TV keyboard's (while editing), or swallowed (keys an input handled: Done,
 Cancel, Enter for a submit; Back while editing, which leaves the input; a
 Back within `backDebounceMs` of the last). Its repeats and release follow
-that decision, so a release never reaches the app without its press.
+that decision, so a release never reaches the app without its press. The
+TV keyboard's keys keep their default (typing, moving the caret).
 
 At start the page registers the table's keys one at a time with
 `tvinputdevice.registerKey`, and again when it becomes visible. Exit,

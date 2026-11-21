@@ -24,7 +24,7 @@ is either NSH's own or one the host chooses.
   runs the old compiled code.
 - `config.xml` privileges: `internet`, `tv.inputdevice`. A declared CSP
   switches Tizen from WARP to CSP mode. The one that works on the TV
-  (the example app's): `default-src 'self'; script-src 'self' 'unsafe-eval';
+  (the example app's): `default-src 'self'; script-src 'self';
   style-src 'self' 'unsafe-inline'; img-src * blob: data:; font-src 'self';
   media-src *; connect-src *; object-src 'self'; worker-src 'self'` (with
   `script-src 'unsafe-eval'` added only for a page-thread build). The
@@ -123,8 +123,10 @@ NshTizenWorker.onInstance(function (exports, engine) {
   closes). The `exports` an `onInstance` hook gets are wrapped the same
   way: call the module only through them.
 - AVPlay is a singleton. The example takes it only when it is free
-  (getState NONE or IDLE): if the host page plays something itself, the
-  component reports `busy` and touches nothing.
+  (getState NONE): if the host page opened or plays something itself, the
+  component reports `busy` and touches nothing. Patina's own player should
+  keep the same rule for seekTo: no AVPlay call until the seek's callback
+  (the example queues them, with a watchdog).
 - Storage: the Worker has IndexedDB but not `localStorage`. The platform
   provides no NSH storage service (`EngineConfig::storage`). Patina's own
   persistence (the chunked SQLite VFS) runs through its imports.
@@ -164,6 +166,14 @@ the root starts at the app's mount root, so that works as is. Back reaches
 the app only as the raw `GoBack` key: there is no NSH back handling
 (`onBackRequest`, `onRequestClose`) behind it. OK on a focused pressable view presses it
 and isn't also delivered as a raw key.
+
+## Upstream requests (NSH)
+
+- `LocalEngine::key_event` and `key_interest` are `#[doc(hidden)]`. This
+  platform routes every key through `key_event`, because it is the only
+  entry that applies the app's `captureKeys` rules and returns the
+  decision; NSH's own web backend uses it the same way. They should become
+  documented platform API (NSH's `docs/dev/platforms.md`, "Input").
 
 ## Inputs
 

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Patina's NSH pin (../nsh-patina at patina-iptv's nsh.rev), so the spike runs
+# the same engine Patina ships.
+[workspace.dependencies]
+nsh-core = { path = "../nsh-patina/crates/nsh-core" }
+nsh-engine = { path = "../nsh-patina/crates/nsh-engine", default-features = false }
+nsh-base = { path = "../nsh-patina/crates/nsh-base", default-features = false }
+iptv-core = { path = "../patina-iptv/crates/iptv-core" }
+log = "0.4"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

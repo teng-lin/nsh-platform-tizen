@@ -1,0 +1,92 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="background:#141C21;color:#E3E8EC;font:26px sans-serif">
+<pre id="out">running…</pre>
+<script>
+/* Launch 1: build, save every chunk, toggle a favorite and save, publish a
+ * new guide in slices on a copy (queries between slices), save. Later
+ * launches: restore from the chunks. Results: localStorage 'vfs.results'. */
+var R = window.__R = { at: Date.now() };
+var SLICE = 1000, PROGRAMS = 250000, CHANNELS = 7257;
+function out() { document.getElementById('out').textContent = JSON.stringify(R, null, 1); }
+function done() { try { var a = JSON.parse(localStorage.getItem('vfs.results') || '[]'); a.push(R); localStorage.setItem('vfs.results', JSON.stringify(a.slice(-6))); } catch (e) {} out(); }
+function idb(cb) { var r = indexedDB.open('vfsprobe', 1); r.onupgradeneeded = function () { r.result.createObjectStore('chunks'); r.result.createObjectStore('meta'); }; r.onsuccess = function () { cb(r.result); }; r.onerror = function () { R.idbError = String(r.error); done(); }; }
+var i, ex, db;
+function flush(label, next) {
+  var t = performance.now(), n = ex.dirty_take(), bytes = 0;
+  var tx = db.transaction(['chunks', 'meta'], 'readwrite'), store = tx.objectStore('chunks');
+  for (var k = 0; k < n; k++) {
+    var idx = ex.dirty_index(k), p = ex.chunk_ptr(idx), len = ex.chunk_len();
+    store.put(new Uint8Array(ex.memory.buffer, p, len).slice().buffer, idx);
+    bytes += len;
+  }
+  tx.objectStore('meta').put(ex.file_size(), 'size');
+  var queued = performance.now() - t;
+  tx.oncomplete = function () { R[label] = { chunks: n, bytes: bytes, copyMs: Math.round(queued), totalMs: Math.round(performance.now() - t) }; out(); next(); };
+  tx.onabort = function () { R[label] = 'abort ' + tx.error; done(); };
+}
+function publish(next) {
+  var t = performance.now(), worst = 0, slices = 0, reads = [], left = PROGRAMS;
+  ex.publish_begin();
+  (function step() {
+    var s0 = performance.now();
+    left = ex.publish_slice(SLICE, PROGRAMS, CHANNELS);
+    worst = Math.max(worst, performance.now() - s0); slices++;
+    var q0 = performance.now(); ex.queries(5); reads.push(performance.now() - q0);
+    if (left > 0) return setTimeout(step, 0);
+    var f0 = performance.now(); var ok = ex.publish_finish();
+    reads.sort(function (a, b) { return a - b; });
+    R.publish = { totalMs: Math.round(performance.now() - t), slices: slices, worstSliceMs: Math.round(worst), finishMs: Math.round(performance.now() - f0), finished: ok,
+      readsP50Ms: +reads[reads.length >> 1].toFixed(1), readsMaxMs: +reads[reads.length - 1].toFixed(1), count: ex.count() };
+    out(); next();
+  })();
+}
+var x = new XMLHttpRequest(); x.open('GET', 'probe.wasm', true); x.responseType = 'arraybuffer';
+x.onload = function () {
+  WebAssembly.instantiate(x.response, { env: {
+    host_now_ms: function () { return Date.now(); },
+    host_random: function (p, l) { crypto.getRandomValues(new Uint8Array(i.exports.memory.buffer, p, l)); }
+  } }).then(function (r) {
+    i = r.instance; ex = i.exports;
+    idb(function (d) {
+      db = d;
+      var t = performance.now();
+      var meta = db.transaction('meta', 'readonly').objectStore('meta').get('size');
+      meta.onsuccess = function () {
+        var size = meta.result;
+        if (size) {
+          R.phase = 'restore';
+          var tx = db.transaction('chunks', 'readonly').objectStore('chunks');
+          var keys = tx.getAllKeys(), vals = tx.getAll();
+          vals.onsuccess = function () {
+            R.idbReadMs = Math.round(performance.now() - t);
+            var c0 = performance.now();
+            ex.load_begin(size);
+            for (var k = 0; k < keys.result.length; k++) {
+              var b = new Uint8Array(vals.result[k]);
+              new Uint8Array(ex.memory.buffer, ex.load_chunk(keys.result[k]), b.length).set(b);
+            }
+            R.copyInMs = Math.round(performance.now() - c0);
+            var o0 = performance.now(); R.init = ex.init(); R.count = ex.count(); R.openMs = Math.round(performance.now() - o0);
+            R.totalMs = Math.round(performance.now() - t);
+            var q0 = performance.now(); R.queryRows = ex.queries(100); R.queries100Ms = Math.round(performance.now() - q0);
+            R.memoryMB = Math.round(ex.memory.buffer.byteLength / 1048576);
+            done();
+          };
+          return;
+        }
+        R.phase = 'build';
+        R.init = ex.init();
+        var b0 = performance.now(); R.dbBytes = ex.build(CHANNELS, PROGRAMS); R.buildMs = Math.round(performance.now() - b0);
+        flush('saveAll', function () {
+          ex.toggle_favorite(42);
+          flush('saveFavorite', function () {
+            publish(function () {
+              flush('savePublished', function () { R.memoryMB = Math.round(ex.memory.buffer.byteLength / 1048576); done(); });
+            });
+          });
+        });
+      };
+    });
+  }).catch(function (e) { R.error = String(e); done(); });
+};
+x.send();
+</script></body></html>

@@ -39,7 +39,7 @@
 
 use std::fmt::Write as _;
 
-use nsh_core::{BorderStyle, Color, EventKind, MountBatch, MountItem, ViewKind, ViewStyle};
+use nsh_core::{BorderStyle, Color, EventKind, MountItem, ViewKind, ViewStyle};
 use serde_json::{Value, json};
 
 use crate::text::Layout;
@@ -60,11 +60,6 @@ pub mod events {
     pub const LOAD: u32 = 32;
     /// An image's `onError`.
     pub const ERROR: u32 = 64;
-}
-
-/// A batch's operations, `[]` when it has none for this platform.
-pub fn batch(batch: &MountBatch) -> Value {
-    Value::Array(batch.items.iter().filter_map(item).collect())
 }
 
 /// Whether this platform shows `item` (or takes it elsewhere: the

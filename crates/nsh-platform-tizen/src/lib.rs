@@ -163,11 +163,8 @@ impl Device {
 /// What the engine hands the page between two pumps.
 #[derive(Default)]
 struct Outbox {
-    /// Each commit's operations, as the JSON text the page parses.
-    batches: Vec<String>,
-    /// Images whose bytes are in memory, for the page to show by their URI
-    /// (before the batches that show them).
-    images: Vec<(String, ImageData)>,
+    /// Each commit's operations, with the in-memory images they show.
+    batches: Vec<Batch>,
     /// The engine asked for a display frame.
     frame: bool,
     /// Errors of the app, as text.
@@ -191,6 +188,9 @@ struct Sent {
     styles: HashMap<u32, u64>,
     texts: HashMap<u32, u64>,
     images: HashMap<Arc<str>, u32>,
+    /// The in-memory images whose bytes the page holds (from their bytes
+    /// to their release, which is decided at a batch's end).
+    on_page: HashSet<Arc<str>>,
     /// The in-memory images each view shows (source, placeholder).
     shown: HashMap<u32, Vec<Arc<str>>>,
 }
@@ -234,11 +234,10 @@ impl Sent {
         let mut released = Vec::new();
         let uris: Vec<Arc<str>> = now.iter().map(|(u, _)| u.clone()).collect();
         for (uri, data) in now {
-            let count = self.images.entry(uri.clone()).or_insert(0);
-            if *count == 0 {
+            *self.images.entry(uri.clone()).or_insert(0) += 1;
+            if self.on_page.insert(uri.clone()) {
                 images.push((uri.to_string(), data));
             }
-            *count += 1;
         }
         let old = match uris.is_empty() {
             true => self.shown.remove(&id),
@@ -318,11 +317,12 @@ impl MountSink for Sink {
         let mut json = String::with_capacity(batch.items.len() * 48);
         let mut deduped = 0;
         let mut released = Vec::new();
+        let mut images = Vec::new();
         for item in &batch.items {
             outbox.anim.apply(item);
             outbox.routes.apply(item);
             if let Some((id, now)) = in_memory(item) {
-                released.extend(outbox.sent.show(id, now, &mut outbox.images));
+                released.extend(outbox.sent.show(id, now, &mut images));
             }
             if let Some(answer) = answer(item) {
                 outbox.answers.push(answer);
@@ -347,14 +347,19 @@ impl MountSink for Sink {
         for op in outbox.anim.outputs() {
             push(&mut json, &op.to_string());
         }
-        // Released after the batch's ops, which no longer show them.
+        outbox.routes.end_batch();
+        // Released after the batch's ops, which no longer show them: only
+        // what no view shows at the batch's end (a view may have taken an
+        // image another let go of), once each.
         for uri in released {
-            push(&mut json, &serde_json::json!(["ir", &*uri]).to_string());
+            if !outbox.sent.images.contains_key(&uri) && outbox.sent.on_page.remove(&uri) {
+                push(&mut json, &serde_json::json!(["ir", &*uri]).to_string());
+            }
         }
-        if !json.is_empty() {
+        if !json.is_empty() || !images.is_empty() {
             json.insert(0, '[');
             json.push(']');
-            outbox.batches.push(json);
+            outbox.batches.push(Batch { json, images });
         }
         stats::add(stats::ENCODE, started);
     }
@@ -406,14 +411,31 @@ fn skipped(item: &nsh_core::MountItem) {
     }
 }
 
+/// One commit for the page.
+#[derive(Default)]
+pub struct Batch {
+    /// Its operations, a JSON array.
+    pub json: String,
+    /// The in-memory images it shows that the page lacks, by URI: handed
+    /// over right before its operations (a later batch's may need bytes an
+    /// earlier one released).
+    pub images: Vec<(String, ImageData)>,
+}
+
+impl Batch {
+    fn ops(json: String) -> Batch {
+        Batch {
+            json,
+            images: Vec::new(),
+        }
+    }
+}
+
 /// What a pump leaves for the page to do.
 #[derive(Default)]
 pub struct Pumped {
-    /// The operations of the commits it made, one JSON array per commit.
-    pub batches: Vec<String>,
-    /// Images whose bytes are in memory, by the URI the batches show them
-    /// by: the page needs them first.
-    pub images: Vec<(String, ImageData)>,
+    /// The commits it made, in order.
+    pub batches: Vec<Batch>,
     /// Call [`Runtime::frame`] at the next display frame.
     pub frame: bool,
     /// Pump again in this many milliseconds (`None`: only on input).
@@ -486,15 +508,20 @@ impl<M: Measure + 'static> Runtime<M> {
         stats::add(stats::PUMP, started);
         let mut outbox = self.lock();
         let animating = outbox.anim.animating();
+        // What the last round produced waits for a pump at once, not for
+        // the next input.
+        let left = outbox.anim.has_finished()
+            || !outbox.routes.transitions.is_empty()
+            || !outbox.answers.is_empty();
+        let next = deadline.map(|at| {
+            at.saturating_duration_since(nsh_core::time::Instant::now())
+                .as_secs_f64()
+                * 1000.0
+        });
         Pumped {
             batches: std::mem::take(&mut outbox.batches),
-            images: std::mem::take(&mut outbox.images),
             frame: std::mem::take(&mut outbox.frame) || animating,
-            next: deadline.map(|at| {
-                at.saturating_duration_since(nsh_core::time::Instant::now())
-                    .as_secs_f64()
-                    * 1000.0
-            }),
+            next: if left { Some(0.0) } else { next },
             errors: std::mem::take(&mut outbox.errors),
         }
     }
@@ -506,15 +533,22 @@ impl<M: Measure + 'static> Runtime<M> {
         let finished = outbox.anim.finished();
         let transitions = std::mem::take(&mut outbox.routes.transitions);
         let answers = std::mem::take(&mut outbox.answers);
-        let states: Vec<_> = transitions
-            .iter()
-            .filter_map(|&(id, on)| Some((id, outbox.routes.states(id, on)?)))
-            .collect();
         drop(outbox);
         let any = !finished.is_empty() || !transitions.is_empty() || !answers.is_empty();
         if !finished.is_empty() {
             self.control.animations_finished(finished);
         }
+        self.transitions(transitions);
+        for (kind, payload) in answers {
+            self.control
+                .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+        }
+        any
+    }
+
+    /// Reports focus transitions in order, each with its focused state
+    /// (always reported: the core tracks FOCUSED for every view).
+    fn transitions(&self, transitions: Vec<(u32, bool)>) {
         for (id, on) in transitions {
             let kind = if on {
                 EventKind::Focus
@@ -522,15 +556,8 @@ impl<M: Measure + 'static> Runtime<M> {
                 EventKind::Blur
             };
             self.control.dispatch_event(id, kind, EventPayload::None);
+            self.control.set_states(id, route::Routes::states(on));
         }
-        for (id, states) in states {
-            self.control.set_states(id, states);
-        }
-        for (kind, payload) in answers {
-            self.control
-                .dispatch_event(nsh_core::ROOT_ID, kind, payload);
-        }
-        any
     }
 
     /// A display frame (asked for with [`Pumped::frame`]).
@@ -541,7 +568,9 @@ impl<M: Measure + 'static> Runtime<M> {
                 outbox.anim.tick();
                 let ops = outbox.anim.outputs();
                 if !ops.is_empty() {
-                    outbox.batches.push(Value::Array(ops).to_string());
+                    outbox
+                        .batches
+                        .push(Batch::ops(Value::Array(ops).to_string()));
                 }
             }
         }
@@ -588,7 +617,9 @@ impl<M: Measure + 'static> Runtime<M> {
             if outbox.anim.scrolled(id, offset) {
                 let ops = outbox.anim.outputs();
                 if !ops.is_empty() {
-                    outbox.batches.push(Value::Array(ops).to_string());
+                    outbox
+                        .batches
+                        .push(Batch::ops(Value::Array(ops).to_string()));
                 }
             }
         }
@@ -608,8 +639,11 @@ impl<M: Measure + 'static> Runtime<M> {
         } else {
             EventKind::KeyUp
         };
-        self.control
-            .dispatch_event(id, kind, EventPayload::Key(event));
+        // The engine's own entry for a key: it sets `default_prevented`
+        // from the mounted `captureKeys` rules (the page cannot wait for
+        // that decision, so it prevents the default of every remote key).
+        self.engine
+            .key_event(id, kind, EventPayload::Key(event), keys::stroke(key));
         self.pump()
     }
 
@@ -635,11 +669,14 @@ impl<M: Measure + 'static> Runtime<M> {
         repeat: bool,
     ) -> Pumped {
         let key = keys::key_name(key_code, dom_key).to_owned();
-        let route = self.lock().routes.route(key_code, key == "Enter", down, id);
+        let route = self
+            .lock()
+            .routes
+            .route(key_code, key == "Enter", down, repeat, id);
         match route {
             route::Route::Key(target) => self.key(target, &key, dom_code, down, repeat),
             route::Route::Press(target) if down && !repeat => self.event(target, "onPress"),
-            route::Route::Press(_) => self.pump(),
+            route::Route::Press(_) | route::Route::Drop => self.pump(),
         }
     }
 
@@ -660,7 +697,13 @@ impl<M: Measure + 'static> Runtime<M> {
     /// it from the focused view.
     pub fn focus(&mut self, id: u32, focused: bool) -> Pumped {
         if focused {
-            self.lock().routes.input_focused();
+            // The view's Blur comes before the input's Focus.
+            let transitions = {
+                let mut outbox = self.lock();
+                outbox.routes.input_focused();
+                std::mem::take(&mut outbox.routes.transitions)
+            };
+            self.transitions(transitions);
         }
         let kind = if focused {
             EventKind::Focus
@@ -793,7 +836,7 @@ mod tests {
             .batches
             .iter()
             .flat_map(|b| {
-                serde_json::from_str::<Value>(b)
+                serde_json::from_str::<Value>(&b.json)
                     .unwrap()
                     .as_array()
                     .unwrap()
@@ -973,18 +1016,42 @@ mod tests {
         assert!(sent.changes("t", 4, text));
     }
 
-    /// Through the engine: a view that leaves and comes back (made again)
-    /// gets its style and text again, and an unchanged restyle is left out.
+    #[component]
+    fn Toggle() -> impl IntoElement {
+        let shown = signal(true);
+        view()
+            .on_key_down(move |_: &KeyEvent| shown.update(|s| *s = !*s))
+            .child(nsh_core::element::dynamic(move || {
+                shown.get().then(|| {
+                    view()
+                        .bg(rgb(0x123456))
+                        .rounded(px(4.0))
+                        .child(text("again").text_color(rgb(0xabcdef)))
+                })
+            }))
+    }
+
+    /// Through the engine: a view made again gets its style and text again
+    /// (the cache forgets a deleted view), exactly as the first time.
     #[test]
     fn a_view_made_again_gets_its_style_and_text() {
-        let (mut runtime, first) = start(Root::of::<Pictures>());
-        let styled = |ops: &[Value]| ops.iter().filter(|op| op[0] == "t" || op[0] == "s").count();
+        let (mut runtime, first) = start(Root::of::<Toggle>());
+        let styled = |ops: &[Value]| {
+            let mut v: Vec<String> = ops
+                .iter()
+                .filter(|op| op[0] == "t" || (op[0] == "s" && op[2] != ""))
+                .map(|op| format!("{} {}", op[0], op[2]))
+                .collect();
+            v.sort();
+            v
+        };
         let before = styled(&first);
-        runtime.remote_key(0, 13, "", "", true, false);
+        assert_eq!(before.len(), 2, "{before:?}");
+        let gone = ops(&runtime.remote_key(0, 13, "", "", true, false));
+        assert!(gone.iter().any(|op| op[0] == "d"));
         runtime.remote_key(0, 13, "", "", false, false);
         let again = ops(&runtime.remote_key(0, 13, "", "", true, false));
-        assert!(again.iter().any(|op| op[0] == "c"));
-        assert!(styled(&again) <= before);
+        assert_eq!(styled(&again), before);
     }
 
     /// A registered font: family, weight, italic, file size.
@@ -1134,13 +1201,18 @@ mod tests {
         )
         .unwrap();
         let first = runtime.pump();
-        let uris: Vec<&str> = first.images.iter().map(|(u, _)| u.as_str()).collect();
+        let uris: Vec<&str> = first
+            .batches
+            .iter()
+            .flat_map(|b| &b.images)
+            .map(|(u, _)| u.as_str())
+            .collect();
         // The PNG once for both views, and the placeholder's SVG.
         assert_eq!(uris.len(), 2, "{uris:?}");
         assert!(uris.iter().any(|u| u.starts_with("data:image/png")));
         assert!(uris.iter().any(|u| u.starts_with("data:image/svg+xml")));
-        let ops = ops(&first);
-        let shows: Vec<_> = ops.iter().filter(|op| op[0] == "im").collect();
+        let first_ops = ops(&first);
+        let shows: Vec<_> = first_ops.iter().filter(|op| op[0] == "im").collect();
         assert!(
             shows
                 .iter()
@@ -1152,15 +1224,121 @@ mod tests {
                 .is_some_and(|p| p.starts_with("data:image/svg"))
         }));
         // Gone: both released, after the views that showed them.
-        let gone = runtime.remote_key(0, 13, "Enter", "Enter", true, false);
-        let released: Vec<Value> = super::tests::ops(&gone)
-            .into_iter()
-            .filter(|op| op[0] == "ir")
-            .collect();
-        assert_eq!(released.len(), 2, "{released:?}");
+        let gone = ops(&runtime.remote_key(0, 13, "Enter", "Enter", true, false));
+        let released: Vec<usize> = (0..gone.len()).filter(|&i| gone[i][0] == "ir").collect();
+        assert_eq!(released.len(), 2, "{gone:?}");
+        let last_delete = (0..gone.len()).rfind(|&i| gone[i][0] == "d").unwrap();
+        assert!(
+            released.iter().all(|&i| i > last_delete),
+            "released after the deletes"
+        );
         // Back: their bytes go again.
         let back = runtime.remote_key(0, 13, "Enter", "Enter", true, false);
-        assert_eq!(back.images.len(), 2);
+        assert_eq!(
+            back.batches.iter().map(|b| b.images.len()).sum::<usize>(),
+            2
+        );
+    }
+
+    const RED: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+    const BLUE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADAgH/pC5K9QAAAABJRU5ErkJggg==";
+
+    #[component]
+    fn Swap() -> impl IntoElement {
+        let swapped = signal(false);
+        let pick = move |a: bool| if a { RED } else { BLUE };
+        view()
+            .on_key_down(move |_: &KeyEvent| swapped.update(|s| *s = !*s))
+            .child(image(move || pick(!swapped.get())).w(px(10.0)).h(px(10.0)))
+            .child(image(move || pick(swapped.get())).w(px(10.0)).h(px(10.0)))
+    }
+
+    /// Two views swapping their images in one batch: nothing is released.
+    #[test]
+    fn a_swap_in_one_batch_releases_nothing() {
+        let (mut runtime, _) = start(Root::of::<Swap>());
+        let swapped = runtime.remote_key(0, 13, "", "", true, false);
+        assert!(
+            ops(&swapped).iter().all(|op| op[0] != "ir"),
+            "{:?}",
+            ops(&swapped)
+        );
+        assert!(swapped.batches.iter().all(|b| b.images.is_empty()));
+    }
+
+    #[component]
+    fn Reuse() -> impl IntoElement {
+        let shown = signal(true);
+        let anchor = element_ref();
+        view()
+            .on_key_down(move |_: &KeyEvent| {
+                shown.set(false);
+                anchor.focus();
+            })
+            .child(
+                view()
+                    .element_ref(&anchor)
+                    .focusable(true)
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .on_focus(move || shown.set(true)),
+            )
+            .child(nsh_core::element::dynamic(move || {
+                shown.get().then(|| image(RED).w(px(10.0)).h(px(10.0)))
+            }))
+    }
+
+    /// An image let go of in one batch and shown again in the next of the
+    /// same pump: the second batch carries its bytes, after the release.
+    #[test]
+    fn an_image_released_then_shown_again_has_its_bytes_after_the_release() {
+        let (mut runtime, _) = start(Root::of::<Reuse>());
+        let pumped = runtime.remote_key(0, 13, "", "", true, false);
+        let release = pumped
+            .batches
+            .iter()
+            .position(|b| b.json.contains("\"ir\""))
+            .expect("released in one batch");
+        let bytes = pumped
+            .batches
+            .iter()
+            .position(|b| !b.images.is_empty())
+            .expect("shown again in a later one");
+        assert!(
+            bytes > release,
+            "bytes in batch {bytes}, release in batch {release}"
+        );
+    }
+
+    #[component]
+    fn Ring() -> impl IntoElement {
+        let child = element_ref();
+        view()
+            .on_key_down(move |_: &KeyEvent| child.focus())
+            .focus_within(|s| s.bg(rgb(0xff0000)))
+            .w(px(100.0))
+            .h(px(100.0))
+            .child(
+                view()
+                    .element_ref(&child)
+                    .focusable(true)
+                    .w(px(10.0))
+                    .h(px(10.0)),
+            )
+    }
+
+    /// A focused view's state is reported whatever it tracks itself: the
+    /// core needs it (here for its parent's `focus-within`).
+    #[test]
+    fn a_focused_view_is_reported_focused() {
+        let (mut runtime, _) = start(Root::of::<Ring>());
+        let focused = ops(&runtime.remote_key(0, 13, "", "", true, false));
+        assert!(
+            focused
+                .iter()
+                .any(|op| op[0] == "s" && op[2].as_str().unwrap().contains("rgb(255,0,0)")),
+            "{focused:?}"
+        );
     }
 
     #[component]
@@ -1208,16 +1386,22 @@ mod tests {
                 .iter()
                 .any(|op| op[0] == "t" && op[2]["runs"][0][0] == "running")
         );
-        let mut done = false;
-        for _ in 0..20 {
+        // The frame that sets the final opacity also shows on_finish's text.
+        for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(5));
             let frame = runtime.frame();
-            if texts(&frame).iter().any(|t| t == "done") {
-                done = true;
-                break;
+            let ops = ops(&frame);
+            let ended = ops
+                .iter()
+                .any(|op| op[0] == "a" && op[2].as_str().is_some_and(|c| c.contains("opacity:1;")));
+            let done = texts(&frame).iter().any(|t| t == "done");
+            assert!(!done || ended, "done before the end");
+            if ended {
+                assert!(done, "on_finish ran in the frame that finished it: {ops:?}");
+                return;
             }
         }
-        assert!(done, "on_finish ran in the frame that finished it");
+        panic!("the animation never ended");
     }
 
     #[component]
@@ -1261,13 +1445,9 @@ mod tests {
         runtime.remote_key(0, 40, "", "", true, false);
         let ok = runtime.remote_key(0, 13, "", "", true, false);
         assert_eq!(texts(&ok), ["second"]);
-        runtime.remote_key(0, 13, "", "", false, false);
+        // Its release presses nothing again.
+        assert!(texts(&runtime.remote_key(0, 13, "", "", false, false)).is_empty());
         runtime.remote_key(0, 40, "", "", false, false);
-        assert_eq!(runtime.key_target(), find_focus(&mut runtime));
-    }
-
-    fn find_focus(runtime: &mut Runtime<ApproxMeasure>) -> u32 {
-        runtime.lock().routes.target()
     }
 
     #[test]

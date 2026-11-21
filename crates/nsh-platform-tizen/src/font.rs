@@ -1,6 +1,6 @@
 //! What the page needs to register a font file (`FontFace`): its family
-//! name, as NSH's core reads it (`nsh_core::font_family`: the typographic
-//! family, WOFF and WOFF2 unwrapped), and its weight and style from
+//! name, as NSH's core reads it (the typographic family; WOFF and WOFF2
+//! unwrapped by `nsh_core::font_data`), and its weight and style from
 //! `ttf-parser`, the reader nsh-core already links (no extra code in the
 //! module). A collection (TTC) gives its first font.
 
@@ -15,11 +15,21 @@ pub struct Face {
     pub italic: bool,
 }
 
-/// The face of the TrueType / OpenType / WOFF / WOFF2 file `data`.
+/// The face of the TrueType / OpenType / WOFF / WOFF2 file `data`. Its
+/// family is read as `nsh_core::font_family` reads it (the typographic
+/// family, else the family), from one unwrapping of the file.
 pub fn parse(data: &[u8]) -> Result<Face, String> {
-    let family = nsh_core::font_family(data)?;
     let unwrapped = nsh_core::font_data(data)?;
     let face = ttf_parser::Face::parse(&unwrapped, 0).map_err(|e| format!("not a font: {e}"))?;
+    let name = |id| {
+        face.names()
+            .into_iter()
+            .filter(|n| n.name_id == id && n.is_unicode())
+            .find_map(|n| n.to_string())
+    };
+    let family = name(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+        .or_else(|| name(ttf_parser::name_id::FAMILY))
+        .ok_or("the font has no family name")?;
     Ok(Face {
         family,
         weight: face.weight().to_number(),

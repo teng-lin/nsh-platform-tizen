@@ -127,6 +127,27 @@ pub fn key_name(code: u32, dom_key: &str) -> &str {
     }
 }
 
+/// The canonical shortcut stroke of key `key` (a DOM name), for
+/// `captureKeys` matching: the arrows, OK, digits and minus; `None` for
+/// the TV's own keys, which only `KeyCapture::All` captures.
+pub fn stroke(key: &str) -> Option<nsh_core::keymap::Keystroke> {
+    use nsh_core::keymap::Key;
+    let key = match key {
+        "ArrowUp" => Key::Up,
+        "ArrowDown" => Key::Down,
+        "ArrowLeft" => Key::Left,
+        "ArrowRight" => Key::Right,
+        "Enter" => Key::Enter,
+        "-" => Key::Char('-'),
+        d if d.len() == 1 && d.as_bytes()[0].is_ascii_digit() => Key::Char(d.as_bytes()[0] as char),
+        _ => return None,
+    };
+    Some(nsh_core::keymap::Keystroke {
+        modifiers: Default::default(),
+        key,
+    })
+}
+
 /// The table as the page reads it: `[[code, key, tizen name or null,
 /// registered at start, the input's own while edited], ...]`.
 pub fn keys_json() -> String {

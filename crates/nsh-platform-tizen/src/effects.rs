@@ -1,5 +1,5 @@
 //! What CSS says of a view beyond its box: shadows, gradients, filters, the
-//! backdrop's blur, transforms, blending, transitions and keyframes. After
+//! transforms, blending, transitions and keyframes. After
 //! NSH's web backend (`nsh-platform-web`'s `encode.rs`), which draws the
 //! same styles in a browser; the Mini Program's render layer is one too.
 
@@ -42,10 +42,8 @@ pub(crate) fn write(css: &mut String, s: &ViewStyle) {
         if !effects.filters.is_empty() {
             let _ = write!(css, "filter:{};", filters(&effects.filters));
         }
-        if !effects.backdrop_filters.is_empty() {
-            let f = filters(&effects.backdrop_filters);
-            let _ = write!(css, "backdrop-filter:{f};-webkit-backdrop-filter:{f};");
-        }
+        // Backdrop filters are not drawn: Chromium 69 has no
+        // `backdrop-filter` (the README's "Not done").
         if !effects.mask_images.is_empty() {
             let images: Vec<String> = effects.mask_images.iter().map(gradient).collect();
             let m = images.join(",");

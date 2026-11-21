@@ -190,24 +190,28 @@ fn mime_of(uri: &str) -> &str {
 
 /// Hands what a pump made to JS.
 fn deliver(pumped: Pumped) {
-    for (uri, data) in &pumped.images {
-        let bytes = data.bytes();
-        let mime = mime_of(uri);
-        // SAFETY: live slices JS copies during the call.
-        unsafe {
-            js_image_bytes(
-                uri.as_ptr(),
-                uri.len(),
-                mime.as_ptr(),
-                mime.len(),
-                bytes.as_ptr(),
-                bytes.len(),
-            )
-        };
-    }
-    for json in pumped.batches {
-        // SAFETY: a live string JS only reads during the call.
-        unsafe { js_submit(json.as_ptr(), json.len()) };
+    for batch in &pumped.batches {
+        // Each batch's images right before it: an earlier batch may have
+        // released one it shows again.
+        for (uri, data) in &batch.images {
+            let bytes = data.bytes();
+            let mime = mime_of(uri);
+            // SAFETY: live slices JS copies during the call.
+            unsafe {
+                js_image_bytes(
+                    uri.as_ptr(),
+                    uri.len(),
+                    mime.as_ptr(),
+                    mime.len(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                )
+            };
+        }
+        if batch.json != "[]" {
+            // SAFETY: a live string JS only reads during the call.
+            unsafe { js_submit(batch.json.as_ptr(), batch.json.len()) };
+        }
     }
     for error in pumped.errors {
         report_error(&error);
@@ -223,26 +227,42 @@ fn deliver(pumped: Pumped) {
 type Call = Box<dyn FnOnce(&mut Runtime<HostMeasure>) -> Pumped>;
 
 thread_local! {
-    /// Calls that arrived while the runtime was busy: a host import that
-    /// calls back into the module (`engine.pump()`, an event) during a
-    /// pump. They run, in order, when the outer call ends.
+    /// Calls that arrived while the runtime was busy (a host import calling
+    /// back into the module during a pump, or during the delivery of what a
+    /// pump made) or not yet there (during the start). They run, in order,
+    /// when the outer call ends.
     static QUEUED: RefCell<std::collections::VecDeque<Call>> = RefCell::default();
+    /// What a pump made is being handed to JS.
+    static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The app is starting: its runtime is not installed yet.
+    static STARTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `f` on the runtime and hands its result to JS, then what was
-/// queued meanwhile. Re-entered (the runtime is borrowed), it queues `f`
-/// instead of aborting the module on a second borrow.
+/// queued meanwhile. Re-entered (the runtime is borrowed, its output being
+/// delivered, or the app still starting), it queues `f` behind the calls
+/// already waiting instead of aborting the module on a second borrow or
+/// running ahead of them.
 fn with_runtime(f: impl FnOnce(&mut Runtime<HostMeasure>) -> Pumped + 'static) {
-    let busy = RUNTIME.with(|r| r.try_borrow_mut().is_err());
+    let busy = STARTING.with(|s| s.get())
+        || DELIVERING.with(|d| d.get())
+        || RUNTIME.with(|r| r.try_borrow_mut().is_err());
     if busy {
         QUEUED.with(|q| q.borrow_mut().push_back(Box::new(f)));
         return;
     }
-    let mut next: Option<Call> = Some(Box::new(f));
+    run(Box::new(f));
+}
+
+/// Runs `first`, then every queued call, each delivered before the next.
+fn run(first: Call) {
+    let mut next = Some(first);
     while let Some(call) = next.take() {
         let pumped = RUNTIME.with(|r| r.borrow_mut().as_mut().map(call));
         if let Some(pumped) = pumped {
+            DELIVERING.with(|d| d.set(true));
             deliver(pumped);
+            DELIVERING.with(|d| d.set(false));
         }
         next = QUEUED.with(|q| q.borrow_mut().pop_front());
     }
@@ -299,13 +319,18 @@ pub extern "C" fn nsh_tz_start(
     let keys = crate::keys::keys_json();
     // SAFETY: a live string JS only reads during the call.
     unsafe { js_remote_keys(keys.as_ptr(), keys.len()) };
-    let Some(mut runtime) = Runtime::start(root, sets, device, HostMeasure) else {
+    STARTING.with(|s| s.set(true));
+    let started = Runtime::start(root, sets, device, HostMeasure);
+    STARTING.with(|s| s.set(false));
+    let Some(mut runtime) = started else {
+        QUEUED.with(|q| q.borrow_mut().clear());
         return 0;
     };
     // SAFETY: a host function without arguments.
     runtime.set_wake(std::sync::Arc::new(|| unsafe { js_wake() }));
     RUNTIME.with(|r| *r.borrow_mut() = Some(runtime));
-    with_runtime(Runtime::pump);
+    // The first pump, then what arrived while starting.
+    run(Box::new(Runtime::pump));
     1
 }
 

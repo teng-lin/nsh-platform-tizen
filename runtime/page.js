@@ -112,16 +112,19 @@
 
     /*
      * Records `text` in __nsh.errors: the same text once, then counted
-     * (__nsh.errorCounts); at most 20 kept. True the first time.
+     * (__nsh.errorCounts; the Worker's import errors are in
+     * __nsh.engine.importErrorCounts); at most 20 kept. True the first time.
      */
     S.note = function (text) {
         var M = this.M;
         text = String(text).slice(0, 500);
         M.errorCounts = M.errorCounts || {};
-        if (M.errorCounts[text]) { M.errorCounts[text]++; return false; }
+        if (M.errorCounts[text]) { M.errorCounts[text]++; this.saveMetrics(); return false; }
         /* Counts are kept past the list's 20 (up to 200 texts), so an error
-         * that left the list is still not reported again. */
-        if (Object.keys(M.errorCounts).length < 200) M.errorCounts[text] = 1;
+         * that left the list is not reported again; past 200, one overflow
+         * count and no report. */
+        if (Object.keys(M.errorCounts).length >= 200) { M.errorOverflow = (M.errorOverflow || 0) + 1; this.saveMetrics(); return false; }
+        M.errorCounts[text] = 1;
         M.errors.push(text);
         if (M.errors.length > 20) M.errors.shift();
         this.saveMetrics();

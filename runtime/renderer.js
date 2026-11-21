@@ -505,7 +505,10 @@ var NshTizen = (function () {
      * see it, nor its release. */
     R.consume = function (e) {
         e.stopPropagation();
-        this.keys[e.keyCode] = 'swallowed';
+        /* Only a fresh press decides: a held key keeps what its press was
+         * (an OK that focused this input is still the app's, release
+         * included). */
+        if (!e.repeat || !this.keys[e.keyCode]) this.keys[e.keyCode] = 'swallowed';
     };
 
     R.inputConfig = function (n, c) {

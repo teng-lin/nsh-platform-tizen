@@ -58,9 +58,9 @@ function NshEngine(options) {
     this.fontsPending = 0;
     this.dead = false;
     this.depth = 0;           /* calls into the module now running */
-    this.errorCounts = {};    /* import errors by text */
+    this.metricsTimer = null;
     this.wakeTimer = null;
-    this.M = { moduleFromCache: null, stubbed: [], logs: [], importErrors: [] };
+    this.M = { moduleFromCache: null, stubbed: [], logs: [], importErrors: [], importErrorCounts: {} };
     this.encoder = new TextEncoder();
     this.decoder = new TextDecoder();
 }
@@ -128,10 +128,19 @@ function NshEngine(options) {
         this.out({ t: 'fatal', text: full });
     };
 
+    /* The metrics to the page within a second (counts that changed). */
+    E.metricsSoon = function () {
+        var self = this;
+        if (this.metricsTimer !== null) return;
+        this.metricsTimer = setTimeout(function () { self.metricsTimer = null; self.out({ t: 'metrics', m: self.M }); }, 1000);
+    };
+
     /* Stops the engine's timers (a fatal error, or the session ended). */
     E.halt = function () {
         clearTimeout(this.pumpTimer);
         clearTimeout(this.wakeTimer);
+        clearTimeout(this.metricsTimer);
+        this.metricsTimer = null;
         this.pumpTimer = null;
         this.wakeTimer = null;
         this.halted = true;
@@ -152,11 +161,15 @@ function NshEngine(options) {
                 throw e;
             }
             var text = (name + ': ' + String(e && e.stack || e)).slice(0, 500);
-            var counts = self.errorCounts;
-            if (counts[text]) { counts[text]++; return 0; }
-            if (Object.keys(counts).length < 200) counts[text] = 1;
-            if (self.M.importErrors.length < 20) self.M.importErrors.push(text);
+            /* In the metrics, which reach the page: each text once, then
+             * counted; past 200 texts one overflow count and no report. */
+            var M = self.M, counts = M.importErrorCounts;
+            if (counts[text]) { counts[text]++; self.metricsSoon(); return 0; }
+            if (Object.keys(counts).length >= 200) { M.importErrorOverflow = (M.importErrorOverflow || 0) + 1; self.metricsSoon(); return 0; }
+            counts[text] = 1;
+            if (M.importErrors.length < 20) M.importErrors.push(text);
             self.out({ t: 'error', text: 'an import threw: ' + text });
+            self.metricsSoon();
             return 0;
         };
         /* The module died while the import ran (it caught the trap

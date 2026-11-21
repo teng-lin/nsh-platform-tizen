@@ -33,7 +33,13 @@
  * seekTo must complete before any other AVPlay call: while a seek runs,
  * every call waits (play, pause, the rect, metadata reads, and a stop,
  * close or reopen from a zap, a hide or the view's removal), and runs
- * when the seek completes, fails, or a watchdog gives up on it. Play and
+ * when the seek's callback comes. Samsung: "During this async operation,
+ * the other API would not be allowed ... wait for one of both callbacks
+ * (SuccessCallback, errorCallback) before any other API call" (AVPlay API
+ * reference, seekTo); getState is not exempted, so nothing polls it. A
+ * seek with no callback after `seekTimeoutMs` is reported to the app as
+ * failed while the queue keeps waiting; after `seekGiveUpMs` the queue
+ * runs anyway (a player that refuses its close then is retried, STUCK). Play and
  * pause follow the state asked last; pause is called only on a stream
  * that has played. While the page is hidden the stream is closed and its
  * position kept; it reopens there when the page shows again, and the
@@ -52,6 +58,31 @@ NshTizen.avplay = (function () {
     /* The seek running on the singleton, and what waits for it. */
     var seekInFlight = null;
     var afterSeek = [];
+    /* Opens that found AVPlay STUCK (by one of ours): tried again once a
+     * close succeeds. */
+    var stuckWaiters = [];
+    var stuckTries = 0;
+
+    /* Retries the close of a STUCK player, a few times, then lets the
+     * waiting opens report busy. */
+    function retryStuck() {
+        if (owner !== STUCK) return;
+        whenIdle(function () {
+            if (owner !== STUCK) return;
+            var p = factory.api();
+            try { p.close(); } catch (e) { /* still refused */ }
+            if (state(p) === 'NONE') {
+                owner = null;
+                stuckTries = 0;
+            } else if (++stuckTries < factory.stuckTries) {
+                setTimeout(retryStuck, factory.stuckRetryMs);
+                return;
+            }
+            var waiting = stuckWaiters;
+            stuckWaiters = [];
+            waiting.forEach(function (f) { f(); });
+        });
+    }
 
     function state(p) {
         try { return p.getState(); } catch (e) { return 'NONE'; }
@@ -102,6 +133,7 @@ NshTizen.avplay = (function () {
                     try { p.close(); } catch (e) { closed = state(p) === 'NONE'; }
                 }
                 owner = closed ? null : STUCK;
+                if (!closed) { stuckTries = 0; setTimeout(retryStuck, factory.stuckRetryMs); }
             });
         }
 
@@ -147,33 +179,42 @@ NshTizen.avplay = (function () {
             }
         }
 
-        /* A seekTo, alone on the singleton: nothing calls AVPlay until it
-         * completes, fails or the watchdog ends it; then what waited runs,
-         * `done(ok)`, and the latest state and seek are applied. */
+        /* A seekTo, alone on the singleton: nothing calls AVPlay until its
+         * callback comes (or, without one, `seekGiveUpMs`); `done(ok)` is
+         * told once, at the callback or as a failure at `seekTimeoutMs`,
+         * whatever the generation by then (an app's seek is the source's,
+         * not the player's). Then what waited runs, and the latest state
+         * and seek are applied. */
         function seekTo(ms, done) {
             var p = av(), my = token;
-            var flight = { ms: ms };
+            var flight = { ms: ms, answered: false };
             seekInFlight = flight;
-            var finish = function (ok) {
+            var answer = function (ok) {
+                if (flight.answered) return;
+                flight.answered = true;
+                if (done) done(ok, my === token);
+            };
+            var release = function (ok) {
                 if (seekInFlight !== flight) return;
                 clearTimeout(flight.timer);
+                clearTimeout(flight.giveUp);
                 seekInFlight = null;
-                /* What waited (a teardown, a reopen) runs whatever the
-                 * generation: the player must still be closed. */
+                answer(ok);
                 var waiting = afterSeek;
                 afterSeek = [];
-                if (my === token && done) done(ok);
                 waiting.forEach(function (f) { f(); });
                 if (my !== token || seekInFlight) return;
                 applyRect();
                 reconcile();
                 if (pendingSeek) seek(pendingSeek);
             };
-            flight.timer = setTimeout(function () { finish(false); }, factory.seekTimeoutMs);
+            /* No callback yet: the app hears it failed, the gate stays. */
+            flight.timer = setTimeout(function () { if (seekInFlight === flight) answer(false); }, factory.seekTimeoutMs);
+            flight.giveUp = setTimeout(function () { release(false); }, factory.seekGiveUpMs);
             try {
-                p.seekTo(ms, function () { finish(true); }, function () { finish(false); });
+                p.seekTo(ms, function () { release(true); }, function () { release(false); });
             } catch (e) {
-                finish(false);
+                release(false);
             }
         }
 
@@ -187,11 +228,22 @@ NshTizen.avplay = (function () {
             if (!p) { emit('error', { code: 'unavailable' }); return; }
             if (owner === ctx) teardown(); else token++;
             var my = token;
-            whenIdle(function () {
+            var attempt = function () {
                 if (my !== token || gone) return;
-                if (!available(p, ctx)) { emit('error', { code: 'busy' }); return; }
+                /* Hidden meanwhile (a zap queued behind a seek, then a
+                 * hide): opened when the page shows again. */
+                if (document.hidden) { hidden = { source: source, ms: startMs }; return; }
+                if (!available(p, ctx)) {
+                    /* Our own stuck player: tried again once it closes. */
+                    if (owner === STUCK && !tried) { stuckWaiters.push(retry); return; }
+                    emit('error', { code: 'busy' });
+                    return;
+                }
                 openNow(p, source, startMs, my);
-            });
+            };
+            var tried = false;
+            var retry = function () { if (tried) { emit('error', { code: 'busy' }); return; } tried = true; attempt(); };
+            whenIdle(attempt);
         }
 
         function openNow(p, source, startMs, my) {
@@ -238,7 +290,7 @@ NshTizen.avplay = (function () {
                         };
                         if (startMs > 0) {
                             /* Back where it was hidden; play waits for it. */
-                            seekTo(startMs, ready);
+                            seekTo(startMs, function (ok, current) { if (current) ready(); });
                         } else {
                             reconcile();
                             /* A play that failed closed it. */
@@ -289,10 +341,13 @@ NshTizen.avplay = (function () {
             if (!prepared || seekInFlight) { pendingSeek = s; return; }
             pendingSeek = null;
             var p = av();
-            seekTo(s.ms, function (ok) {
+            seekTo(s.ms, function (ok, current) {
+                /* Answered for this source, whatever player generation runs
+                 * now (a hide closed it meanwhile): not asked again. */
+                if (!props.source || props.source.token !== s.token) return;
+                doneSeek = { token: s.token, id: s.id };
                 var duration = 0;
-                if (ok) {
-                    doneSeek = { token: s.token, id: s.id };
+                if (ok && current && !seekInFlight) {
                     try { duration = p.getDuration(); } catch (e) { /* live */ }
                 }
                 var timeline = { token: s.token, seekId: s.id, ms: s.ms, durationMs: duration, seekable: duration > 0 };
@@ -304,12 +359,14 @@ NshTizen.avplay = (function () {
         function visibility() {
             if (document.hidden) {
                 if (opened && owner === ctx) {
-                    /* During a seek the position is where it goes. */
-                    var ms = seekInFlight ? seekInFlight.ms : 0;
-                    if (!seekInFlight) {
-                        try { ms = av().getCurrentTime(); } catch (e) { /* live */ }
-                    }
-                    hidden = { source: opened, ms: ms };
+                    /* The position as the player has it once no seek runs
+                     * (where a running one actually took it), read before
+                     * the close. */
+                    var h = hidden = { source: opened, ms: 0 };
+                    whenIdle(function () {
+                        if (owner !== ctx) return;
+                        try { h.ms = av().getCurrentTime(); } catch (e) { /* live */ }
+                    });
                     teardown();
                 }
             } else if (hidden) {
@@ -347,5 +404,8 @@ NshTizen.avplay = (function () {
 
     factory.api = function () { return typeof webapis !== 'undefined' && webapis.avplay ? webapis.avplay : null; };
     factory.seekTimeoutMs = 5000;
+    factory.seekGiveUpMs = 30000;
+    factory.stuckRetryMs = 1000;
+    factory.stuckTries = 10;
     return factory;
 })();

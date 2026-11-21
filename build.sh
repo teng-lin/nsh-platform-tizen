@@ -28,6 +28,11 @@ rm -rf "$stage" && mkdir -p "$stage/assets"
 "$root/runtime/bundle.sh" "$stage"
 cp "$root"/app/{index.html,page-thread.html,page.css,page-thread.js,host.js} "$stage/"
 sed "s|<content src=\"index.html\"/>|<content src=\"${NSH_PAGE:-index.html}\"/>|" "$root/app/config.xml" > "$stage/config.xml"
+# The page-thread benchmark compiles WebAssembly on the page: Chromium 69
+# allows that only with 'unsafe-eval'. The Worker build does without.
+if [[ "${NSH_PAGE:-}" == page-thread.html ]]; then
+    sed -i "s|script-src 'self';|script-src 'self' 'unsafe-eval';|" "$stage/config.xml"
+fi
 cp "$root/../patina-iptv/art/icon/play-512.png" "$stage/icon.png"
 cp "$root/../patina-iptv/art/icon/play-512.png" "$stage/assets/logo.png"
 cp "$root/target/tizen-wasm/wasm32-unknown-unknown/release/guide_spike.wasm" "$stage/app.wasm"
@@ -42,6 +47,8 @@ fi
 printf "/* Written by build.sh. */\nwindow.NSH_MODULE_VERSION = '%s';\nwindow.NSH_FONTS = %s;\n" "$version" "$fonts" > "$stage/app-config.js"
 if [[ -n "${NSH_BENCH:-}" ]]; then
     sed -i 's|<!--bench-->|<script src="nsh-bench.js"></script>|' "$stage/index.html" "$stage/page-thread.html"
+else
+    rm "$stage/nsh-bench.js"
 fi
 ls -la "$stage/app.wasm"
 tizen="$(command -v tizen || echo "$HOME/tizen-studio/tools/ide/bin/tizen")"

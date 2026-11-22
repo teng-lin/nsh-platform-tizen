@@ -163,11 +163,13 @@ delivers, so the decoder should accept them; the platform won't remap them.
 Patina's `input::window` focuses its root only on long-press platforms. On
 Tizen its window view hears keys without a focus, because a key reported at
 the root starts at the app's mount root, so that works as is. Back is the
-`GoBack` key and, on the release of a press the app's `captureKeys` did not
-take, the back button: the newest modal's `onRequestClose`, else the app's
-`onBackPress` (`on_back_press`), else the app leaves, as on Android. The
-release reaches the app's key listeners first, so iptv-nav decides a tap
-or a hold before the back button runs. OK on a focused pressable view
+`GoBack` key and, on the release of a press whose down and repeats the
+app's `captureKeys` took none of, the back button: the `onRequestClose` of
+the modal shown last (closing it here with `closeOnEscape`, then
+`onDismiss`), else the app's `onBackPress` (`on_back_press`), else the app
+leaves, as on Android. The release reaches the app's key listeners and is
+committed first, so iptv-nav decides a tap or a hold, and a confirmation
+it opens on the release is what the back button closes. OK on a focused pressable view
 is delivered as a key first (so `captureKeys` can take it, and ancestors
 hear it) and presses the view only when nothing captured it.
 

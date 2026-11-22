@@ -217,12 +217,19 @@ Volume, Menu and Source stay the TV's. `code` is the browser's
 Worker, so it prevents the default of every key in the table.
 
 Back is also the back button, as on Android: the app hears its press,
-repeats and release as `GoBack` keys and, on the release of a press its
-`captureKeys` did not take, the newest modal gets `onRequestClose`
-(reason `cancel`); without a modal the app's `onBackPress` runs while it
-listens, and the app leaves (`Command::ExitApp`'s path) when none does or
-no listener takes it (`Command::Back`). A TV app tells a tap from a hold
-on the release before it goes back. There are no stacks here (no
+repeats and release as `GoBack` keys, and the release of a press whose
+down and repeats the app's `captureKeys` took none of is the back button
+(the release's own capture and target do not matter). The release is
+committed first, so the back button acts on what it left (a TV app tells a
+tap from a hold on the release, and may open a confirmation there): the
+modal shown last (presentation order, as Android's, not drawing order)
+gets `onRequestClose` (reason `cancel`) and, with `closeOnEscape` (the
+default), closes here: it leaves the page, `onDismiss` follows, and until
+the app takes it out or shows it again keys and Back go past it (it is not
+asked to close twice). Without a modal the app's `onBackPress` runs while
+it listens, and the app leaves (`Command::ExitApp`'s path, after the other
+effects) when none does or no listener takes it (`Command::Back`, which
+also goes to the modal shown last). There are no stacks here (no
 `popOnBack`, `onBackRequest`).
 
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV

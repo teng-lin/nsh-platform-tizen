@@ -22,9 +22,13 @@ if [[ -n "${NSH_APP_FONT:-}" ]]; then
     export NSH_APP_FONT NSH_APP_FONT_FAMILY
     features="${features:+$features,}app-font"
 fi
+wasm_targets=(-p guide-spike)
+if [[ "${1:-}" == "--stage" ]]; then
+    wasm_targets+=(-p nsh-platform-tizen --lib --example back-focus)
+fi
 RUSTFLAGS="-C target-cpu=mvp -C target-feature=+sign-ext,+mutable-globals" \
     cargo "+$nightly" build -Zbuild-std=std,panic_abort --target wasm32-unknown-unknown \
-    --release -p guide-spike ${features:+--features "$features"} --target-dir "$root/target/tizen-wasm" \
+    --release "${wasm_targets[@]}" ${features:+--features "$features"} --target-dir "$root/target/tizen-wasm" \
     --config "profile.release.opt-level=${NSH_OPT:-3}"
 stage="$root/target/stage"
 rm -rf "$stage" && mkdir -p "$stage/assets"
@@ -55,6 +59,7 @@ else
 fi
 ls -la "$stage/app.wasm"
 if [[ "${1:-}" == "--stage" ]]; then
+    cp "$root/target/tizen-wasm/wasm32-unknown-unknown/release/examples/back_focus.wasm" "$stage/back-focus.wasm"
     exit 0
 fi
 tizen="$(command -v tizen || echo "$HOME/tizen-studio/tools/ide/bin/tizen")"

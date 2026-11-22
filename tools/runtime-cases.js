@@ -641,6 +641,23 @@
             r.apply([['c', 85, 'view'], ['i', 72, 85, null], ['fo', 85, true]]);
             r.apply([['f', 84, 0, 0, 200, 40]]);
             check(document.activeElement !== el(84), 'and a newer focus request' + at + ': ' + active());
+
+            r.apply(input(86, 72, true, 0).concat(input(87, 1, true, 0)));
+            r.apply([['fo', 72, false], ['f', 86, 0, 0, 200, 40]]);
+            check(document.activeElement !== el(86), 'blurring a container cancels its pending input' + at);
+            r.apply([['f', 87, 0, 0, 200, 40]]);
+            check(document.activeElement === el(87), 'a pending input outside the blurred container can still focus' + at);
+            blur();
+
+            r.apply(input(88, 72, true, 0).concat(input(89, 1, true, 0)));
+            r.apply([['fo', 1, false], ['f', 88, 0, 0, 200, 40], ['f', 89, 0, 0, 200, 40]]);
+            check(document.activeElement !== el(88) && document.activeElement !== el(89), 'blurring the root cancels all pending inputs' + at);
+
+            r.apply(input(90, 72, true, 0));
+            r.apply([['c', 91, 'view'], ['i', 1, 91, null], ['r', 72], ['i', 91, 72, null], ['f', 90, 0, 0, 200, 40]]);
+            check(document.activeElement === el(90), 'reparenting a container within a batch keeps its pending input' + at);
+            blur();
+
             check(r.autoFocus.length === 0, 'nothing is left waiting' + at + ': ' + r.autoFocus.length);
             r.dispose();
             box.parentNode.removeChild(box);

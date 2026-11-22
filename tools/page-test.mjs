@@ -131,6 +131,73 @@ async function page() {
 
 const text = 'Array.prototype.map.call(document.querySelectorAll("#app span"), function (s) { return s.textContent; }).join("|")';
 
+async function backFocus(p, thread) {
+    const editor = 'document.querySelector("[data-testid=editor]")';
+    const transient = 'document.querySelector("[data-testid=transient]")';
+    const heard = (event) => text + '.includes(' + JSON.stringify(event + ';') + ')';
+    const count = (event) => '(' + text + '.split(' + JSON.stringify(event + ';') + ').length - 1)';
+    const backgroundFocused = 'getComputedStyle(document.querySelector("[data-testid=background]")).backgroundColor === "rgb(0, 128, 0)"';
+    await p.evaluate(`(function () {
+        window.__backTest = { exits: 0, sent: [] };
+        var s = NshTizen.start({ container: document.getElementById('app'), module: 'back-focus.wasm',
+            thread: ${JSON.stringify(thread)}, backDebounceMs: 0, onExit: function () { window.__backTest.exits++; } });
+        var send = s.send;
+        s.send = function (m) {
+            window.__backTest.sent.push(m);
+            send.call(s, m);
+            if (m.t !== 'key' || m.keyCode !== 10009 || m.down || !s.renderer.editing) return;
+            // The page still sees the editor when this key is queued after the Back release.
+            ['keydown', 'keyup'].forEach(function (kind) {
+                var event = new KeyboardEvent(kind, { bubbles: true, cancelable: true });
+                Object.defineProperty(event, 'keyCode', { value: 406 });
+                document.activeElement.dispatchEvent(event);
+            });
+        };
+        return true;
+    })()`);
+    check(await p.until(editor), 'the Back test modal is mounted');
+    await p.call('Input.dispatchKeyEvent', { type: 'rawKeyDown', windowsVirtualKeyCode: 10009, nativeVirtualKeyCode: 10009 });
+    check(await p.until('document.activeElement.tagName === "INPUT" && ' + heard('editor focus')), 'Back down focused the editor');
+    await p.call('Input.dispatchKeyEvent', { type: 'keyUp', windowsVirtualKeyCode: 10009, nativeVirtualKeyCode: 10009 });
+    check(await p.until('!' + editor + ' && ' + heard('root key')), 'Back dismissed the modal and the queued key reached the root');
+    check(await p.evaluate('__backTest.sent.some((m) => m.t === "key" && m.keyCode === 406 && m.down && m.id !== 0)'),
+        'the queued key carried the dismissed input ID');
+    check(!await p.evaluate(heard('modal key')), 'the dismissed modal heard no queued key');
+    check(await p.evaluate(count('input blur')) === 1, 'the editor reported one Blur');
+
+    await p.key(10009);
+    check(await p.until(heard('handled')), 'the app handled the next Back while the dismissed modal remained mounted in the engine');
+    check(await p.evaluate(count('editor close')) === 1, 'the modal dismissed exactly once');
+    check(await p.evaluate('__backTest.exits') === 0, 'the handled Back did not exit');
+
+    await p.key(403);
+    await p.key(404);
+    check(await p.until(editor), 'the app reinserted the modal');
+    await p.key(406);
+    check(await p.until(heard('modal key')), 'the reinserted modal received keys again');
+
+    await p.key(403);
+    await p.key(405);
+    await p.key(10009);
+    check(await p.until(heard('declined') + ' && ' + heard('confirmation close') + ' && !document.querySelector("[data-testid=confirmation]")'),
+        'a Back listener that returned false let the modal it opened dismiss');
+    check(await p.evaluate('__backTest.exits') === 0, 'default Back closed the modal without exiting');
+
+    await p.key(403);
+    await p.key(49, '1');
+    check(await p.until(backgroundFocused), 'the background view took focus before Back');
+    await p.key(10009);
+    check(await p.until(heard('transient close') + ' && !' + transient, 5000), 'Back dismissed the auto-focus modal opened on release');
+    check(await p.evaluate(`(function () {
+        var focused = __backTest.sent.filter((m) => m.t === 'focus' && m.on);
+        return focused.length === 2 && __backTest.sent.some((m) => m.t === 'states' && m.id === focused[1].id && m.states);
+    })()`), 'the page reported the transient input\'s Focus and focused state');
+    await p.key(406);
+    check(await p.until(heard('background key'), 5000), 'the restored view received the next key');
+    check(await p.evaluate(count('background focus') + ' === 2 && ' + count('background blur') + ' === 1 && !' + heard('transient focus') + ' && ' + backgroundFocused),
+        'delayed input focus events and state left the restored view focused');
+}
+
 for (const file of ['index.html', 'page-thread.html']) {
     console.log(`# ${file}`);
     const p = await page();
@@ -282,6 +349,7 @@ for (const file of ['index.html', 'page-thread.html']) {
     check(await p.until('window.__nsh.firstPaintAt > 0', 20000), 'a start at scale 1 after it paints');
     const restored = await p.evaluate('(function () { var a = document.getElementById("app"); return a.style.zoom + "|" + a.style.width + "|" + a.clientWidth; })()');
     check(restored === unzoomed, 'and the container is as before the zoom: ' + unzoomed + ' / ' + restored);
+    await backFocus(p, metrics.mode);
     p.ws.close();
 }
 

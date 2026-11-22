@@ -21,6 +21,13 @@
 //! root's content as it was, never content that replaced it). A release
 //! without a press is dropped.
 //!
+//! The remote's Back is also the back button ([`Routes::back`]), as on
+//! Android: on the release of a press the app's `captureKeys` did not
+//! take, the newest modal is asked to close; without one the app's
+//! `onBackPress` hears it when it listens (the core sends `Command::Back`
+//! when no listener takes it); else, and on `Command::Back`, the app
+//! leaves ([`Routes::default_back`]). This platform has no stacks.
+//!
 //! The focus of views (not inputs, whose focus is the page's `<input>`) is
 //! kept here too. `Command::Focus` / `Blur` on a view, an input taking the
 //! focus, and the focused view leaving the tree (detached, or under a
@@ -46,6 +53,17 @@ pub(crate) enum Route {
     Drop,
 }
 
+/// What the back button acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Back {
+    /// The newest modal is asked to close (`onRequestClose`).
+    Modal(u32),
+    /// The app's `onBackPress`, on the root.
+    App,
+    /// The app leaves (`Command::ExitApp`'s).
+    Exit,
+}
+
 /// A key held down.
 struct Held {
     route: Route,
@@ -61,6 +79,8 @@ pub(crate) struct Routes {
     inputs: HashSet<u32>,
     pressable: HashSet<u32>,
     modals: HashSet<u32>,
+    /// The root listens to the back button (`onBackPress`).
+    back_press: bool,
     /// The focused view (not an input).
     focused: Option<u32>,
     /// The input being edited (its DOM focus), as the page reported it.
@@ -112,6 +132,9 @@ impl Routes {
                 }
             }
             MountItem::Events { id, events } => {
+                if *id == ROOT_ID {
+                    self.back_press = events.contains(EventKind::BackPress);
+                }
                 if events.contains(EventKind::Press) {
                     self.pressable.insert(*id);
                 } else {
@@ -235,6 +258,26 @@ impl Routes {
                 .and_then(|c| c.iter().copied().find(|c| !self.modals.contains(c)))
                 .unwrap_or(m),
             None => ROOT_ID,
+        }
+    }
+
+    /// What the back button acts on now: the newest modal, else the app's
+    /// `onBackPress` while the root listens, else what `Command::Back`
+    /// does.
+    pub(crate) fn back(&self) -> Back {
+        match self.top_modal() {
+            Some(modal) => Back::Modal(modal),
+            None if self.back_press => Back::App,
+            None => Back::Exit,
+        }
+    }
+
+    /// `Command::Back`, the back button as without the app's listeners:
+    /// the newest modal is asked to close, else the app leaves.
+    pub(crate) fn default_back(&self) -> Back {
+        match self.top_modal() {
+            Some(modal) => Back::Modal(modal),
+            None => Back::Exit,
         }
     }
 
@@ -553,6 +596,29 @@ mod tests {
         // Content unchanged: the release goes to it.
         assert_eq!(r.route(40, false, true, false, 0), Route::Key(ROOT_ID));
         assert_eq!(r.route(40, false, false, false, 0), Route::Key(30));
+    }
+
+    #[test]
+    fn back_goes_to_the_newest_modal_else_the_app_else_leaves() {
+        let mut r = tree();
+        assert_eq!(r.back(), Back::Exit, "no listener: Command::Back's");
+        let mut listens = nsh_core::EventMask::default();
+        listens.set(EventKind::BackPress, true);
+        r.apply(&MountItem::Events {
+            id: ROOT_ID,
+            events: listens,
+        });
+        assert_eq!(r.back(), Back::App);
+        assert_eq!(r.default_back(), Back::Exit);
+        modal(&mut r, 9, 1, None, 10);
+        assert_eq!(r.back(), Back::Modal(9));
+        assert_eq!(r.default_back(), Back::Modal(9));
+        r.apply(&MountItem::Remove { id: 9 });
+        r.apply(&MountItem::Events {
+            id: ROOT_ID,
+            events: nsh_core::EventMask::default(),
+        });
+        assert_eq!(r.back(), Back::Exit, "the app stopped listening");
     }
 
     #[test]

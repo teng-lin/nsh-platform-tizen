@@ -216,9 +216,14 @@ Volume, Menu and Source stay the TV's. `code` is the browser's
 `KeyboardEvent.code`. No `default_prevented`: the page can't wait for the
 Worker, so it prevents the default of every key in the table.
 
-Not done: Back reaches the app only as the raw `GoBack` key; there is no
-NSH back handling (`onBackRequest`, `onRequestClose`, `popOnBack`) behind
-it yet.
+Back is also the back button, as on Android: the app hears its press,
+repeats and release as `GoBack` keys and, on the release of a press its
+`captureKeys` did not take, the newest modal gets `onRequestClose`
+(reason `cancel`); without a modal the app's `onBackPress` runs while it
+listens, and the app leaves (`Command::ExitApp`'s path) when none does or
+no listener takes it (`Command::Back`). A TV app tells a tap from a hold
+on the release before it goes back. There are no stacks here (no
+`popOnBack`, `onBackRequest`).
 
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV
 keyboard. It handles value (dropped if the user typed since), placeholder
@@ -398,7 +403,7 @@ Worker's per-key cost stays in the engine; the renderer halved its share.
 | An opaque background hides AVPlay's video | Followed: transparent down to `body`, the `<object>` first in `body`. The picture couldn't be checked (no screenshots); the player reached `ready` with its size. |
 | AVPlay call order, close after errors, tokens, stop while hidden | Implemented. On the TV: open, prepare, play, pause and zap. Against a fake AVPlay in headless Chromium (`tools/runtime-cases.js`): the call order, late callbacks of a replaced stream dropped, a throwing `play()` and an error both closing and releasing the player, a seek before ready deferred. The hidden path wasn't exercised on the TV (`tizen run` relaunched the app). |
 | Register keys one by one, again when visible; not Exit or Volume | Implemented. The registration worked; re-registration wasn't exercised. |
-| Back debounce (about 600 ms) | Implemented (`backDebounceMs`). Not exercised with a real remote. |
+| Back debounce (about 600 ms) | Implemented (`backDebounceMs`, 0 turns it off; Patina does, as Android has none). Not exercised with a real remote. |
 | IME Done/Cancel are 65376 / 65385; blur when focus leaves | On the TV, with synthetic keys: Done submits without the app also seeing it, Back blurs without reaching the app. |
 | Declaring a CSP switches Tizen to CSP mode | The example app declares one; the Worker, wasm compile, styles, images and AVPlay all work under it on the TV. |
 | About 120 MB JS heap budget | The page uses 10 MB (the Worker's heap isn't measured). |

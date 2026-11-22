@@ -57,6 +57,10 @@ const fn optional(code: u32, key: &'static str, tizen: &'static str) -> RemoteKe
     }
 }
 
+/// The name of the remote's Back, which is also the back button
+/// (`route::Routes::back`).
+pub const BACK: &str = "GoBack";
+
 /// Every key this platform names, from a 2020 set's
 /// `tvinputdevice.getSupportedKeys()` (UN55TU7000, Tizen 5.5).
 pub const KEYS: &[RemoteKey] = &[
@@ -65,7 +69,7 @@ pub const KEYS: &[RemoteKey] = &[
     always(38, "ArrowUp"),
     always(39, "ArrowRight"),
     always(40, "ArrowDown"),
-    always(10009, "GoBack"),
+    always(10009, BACK),
     registered(48, "0", "0"),
     registered(49, "1", "1"),
     registered(50, "2", "2"),

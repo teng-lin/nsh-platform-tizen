@@ -566,6 +566,32 @@
         });
     });
 
+    /* An `autoFocus` input takes the DOM focus (the TV keyboard) when it
+     * mounts, with its configuration after its insert in the batch, as the
+     * engine commits them; one without `auto`, or not attached, does not. */
+    later.push(function () {
+        var box = document.createElement('div');
+        /* Focusable: not `visibility: hidden`. */
+        box.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px;opacity:0';
+        document.body.appendChild(box);
+        var sent = [];
+        var r = new NshTizen.Renderer(box, function (m) { sent.push(m); }, metrics(), 1);
+        var config = function (auto) { return { css: '', ph: '', type: 'text', ml: false, max: -1, off: false, submit: 'keep', auto: auto }; };
+        r.apply([['c', 72, 'view'], ['c', 73, 'input'], ['i', 72, 73, null], ['c', 74, 'input'], ['i', 72, 74, null],
+            ['i', 1, 72, null], ['in', 73, config(true)], ['in', 74, config(false)]]);
+        check(document.activeElement === r.nodes[73].input.el, 'the auto-focused input has the DOM focus: ' + (document.activeElement && document.activeElement.id));
+        check(r.editing === r.nodes[73] && sent.some(function (m) { return m.t === 'focus' && m.id === 73 && m.on === 1; }),
+            'and the app hears it is edited');
+        r.nodes[73].input.el.blur();
+        r.apply([['c', 75, 'input'], ['in', 75, config(true)]]);
+        check(document.activeElement !== r.nodes[75].input.el, 'an input not inserted takes no focus');
+        r.apply([['c', 76, 'view'], ['c', 77, 'input'], ['i', 76, 77, null], ['in', 77, config(true)]]);
+        check(document.activeElement !== r.nodes[77].input.el, 'nor one under a detached view');
+        r.dispose();
+        box.parentNode.removeChild(box);
+        return Promise.resolve();
+    });
+
     /* An app OK whose press focused an input: its repeats reach the page's
      * handler (still the app's), and its release is sent. */
     later.push(function () {

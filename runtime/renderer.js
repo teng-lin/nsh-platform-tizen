@@ -119,7 +119,7 @@ var NshTizen = (function () {
         this.componentNodes = [];
         this.placed = false;      /* a frame or the tree changed in this batch */
         this.blobs = {};          /* in-memory image URI -> blob URL */
-        this.autoFocus = null;
+        this.autoFocus = [];      /* inputs inserted in this batch (`auto` focuses one) */
         this.disposed = false;
         /* Each held key's disposition, decided at its press: 'app' (sent
          * to the engine), 'swallowed' (an input or the page consumed it)
@@ -220,10 +220,16 @@ var NshTizen = (function () {
             }
         }
         if (this.placed && this.componentNodes.length) this.placeComponents();
-        if (this.autoFocus) {
-            var a = this.autoFocus;
-            this.autoFocus = null;
-            if (a.input && this.live(a) && this.attached(a)) a.input.el.focus();
+        /* Decided at the batch's end: an input's configuration (`auto`)
+         * comes after its insert in the batch that mounts it. The last
+         * one inserted takes the focus. */
+        if (this.autoFocus.length) {
+            var inserted = this.autoFocus;
+            this.autoFocus = [];
+            for (var k = inserted.length - 1; k >= 0; k--) {
+                var a = inserted[k];
+                if (a.input && a.input.config.auto && this.live(a) && this.attached(a)) { a.input.el.focus(); break; }
+            }
         }
         M.batches++;
         M.ops += ops.length;
@@ -254,7 +260,7 @@ var NshTizen = (function () {
         parent.el.insertBefore(child.el, b && b.el.parentNode === parent.el ? b.el : null);
         child.parent = parent;
         this.placed = true;
-        if (child.input && child.input.config.auto) this.autoFocus = child;
+        if (child.input) this.autoFocus.push(child);
     };
 
     /* A detached subtree keeps no DOM focus: the TV keyboard closes. */

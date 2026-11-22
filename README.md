@@ -228,7 +228,8 @@ on the release before it goes back. There are no stacks here (no
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV
 keyboard. It handles value (dropped if the user typed since), placeholder
 and its color, type (`password`, `number`, `email`, `tel`, `url`), max
-length, read only and auto focus. A masked input is always one line (a
+length, read only and auto focus (decided at the end of the batch that
+inserts the input, whose configuration follows its insert). A masked input is always one line (a
 `<textarea>` cannot hide its text). Changing `multiline` while typing keeps
 the text, the focus and the selection. Focus and blur commands, change and submit
 events, and Focus/Blur all work. Done (65376) submits, and blurs unless the

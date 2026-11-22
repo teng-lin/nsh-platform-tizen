@@ -188,4 +188,7 @@ hear it) and presses the view only when nothing captured it.
 as `on_change` / `on_submit`. The keyboard's Done (65376) submits; Cancel
 (65385) and Back leave the input. While an input is being edited, the
 arrows, OK and digits belong to the keyboard. Other keys still reach the
-app through the input's ancestors.
+app through the input's ancestors. `auto_focus` works as on Android: the
+input takes the focus once, when it first mounts, as soon as it is shown
+and sized (a search field opening with its keyboard up), unless another
+input is being edited or the same commit focused something else.

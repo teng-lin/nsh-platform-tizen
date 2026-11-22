@@ -98,6 +98,7 @@ var NshTizen = (function () {
         this.focusable = null;
         this.comp = null;
         this.input = null;
+        this.configured = false;  /* an input's first configuration came */
         this.img = null;
         this.sizer = null;
         this.sx = 0; this.sy = 0;
@@ -119,7 +120,13 @@ var NshTizen = (function () {
         this.componentNodes = [];
         this.placed = false;      /* a frame or the tree changed in this batch */
         this.blobs = {};          /* in-memory image URI -> blob URL */
-        this.autoFocus = [];      /* inputs inserted in this batch (`auto` focuses one) */
+        /* `autoFocus` inputs waiting to take the DOM focus, oldest first:
+         * armed by an input's first configuration (as Android's InputBox),
+         * tried at each batch's end until one can take it (shown, sized),
+         * dropped on its blur or removal or a newer focus request. */
+        this.autoFocus = [];
+        this.armed = [];          /* those armed in this batch */
+        this.focusRequested = false; /* a `fo` focus ran in this batch */
         this.disposed = false;
         /* Each held key's disposition, decided at its press: 'app' (sent
          * to the engine), 'swallowed' (an input or the page consumed it)
@@ -221,16 +228,11 @@ var NshTizen = (function () {
         }
         if (this.placed && this.componentNodes.length) this.placeComponents();
         /* Decided at the batch's end: an input's configuration (`auto`)
-         * comes after its insert in the batch that mounts it. The last
-         * one inserted takes the focus. */
-        if (this.autoFocus.length) {
-            var inserted = this.autoFocus;
-            this.autoFocus = [];
-            for (var k = inserted.length - 1; k >= 0; k--) {
-                var a = inserted[k];
-                if (a.input && a.input.config.auto && this.live(a) && this.attached(a)) { a.input.el.focus(); break; }
-            }
-        }
+         * comes after its insert in the batch that mounts it, and its
+         * frame may come later still. */
+        if (this.autoFocus.length) this.focusWaiting();
+        this.armed = [];
+        this.focusRequested = false;
         M.batches++;
         M.ops += ops.length;
         M.applyMs += performance.now() - started;
@@ -260,15 +262,28 @@ var NshTizen = (function () {
         parent.el.insertBefore(child.el, b && b.el.parentNode === parent.el ? b.el : null);
         child.parent = parent;
         this.placed = true;
-        if (child.input) this.autoFocus.push(child);
     };
 
-    /* A detached subtree keeps no DOM focus: the TV keyboard closes. */
+    /* A detached subtree keeps no DOM focus: the TV keyboard closes; an
+     * input in it waiting for the focus stops waiting (one armed in this
+     * batch has not waited yet). */
     R.detach = function (n) {
         if (n.el.parentNode) n.el.parentNode.removeChild(n.el);
         n.parent = null;
         if (this.editing && !this.attached(this.editing)) this.editing.input.el.blur();
+        if (this.autoFocus.length) {
+            var self = this;
+            this.autoFocus = this.autoFocus.filter(function (a) {
+                return self.armed.indexOf(a) >= 0 || !self.within(a, n);
+            });
+        }
         this.placed = true;
+    };
+
+    /* Whether `n` is `ancestor` or under it. */
+    R.within = function (n, ancestor) {
+        for (var p = n; p; p = p.parent) if (p === ancestor) return true;
+        return false;
     };
 
     R.destroy = function (n) {
@@ -282,6 +297,7 @@ var NshTizen = (function () {
         if (n.input) {
             if (this.editing === n) { this.editing = null; n.input.el.blur(); }
             this.setPlaceholderRule(n.id, '');
+            this.stopWaiting(n);
         }
         if (n.img) { n.img.el.onload = null; n.img.el.onerror = null; }
         n.parent = null;
@@ -490,6 +506,8 @@ var NshTizen = (function () {
         });
         el.addEventListener('focus', function () {
             if (!self.live(n) || n.input !== input || input.swapping) return;
+            /* Whoever focused it, no auto focus waits any more. */
+            self.autoFocus = [];
             self.editing = n;
             self.inputFocus(n, true);
         });
@@ -538,6 +556,46 @@ var NshTizen = (function () {
         this.inputContent(n, input.box ? input.box[0] : 0, input.box ? input.box[1] : 0,
             input.box ? input.box[2] : n.w, input.box ? input.box[3] : n.h);
         this.setPlaceholderRule(n.id, c.phc ? '#nsh-in-' + n.id + '::placeholder{color:' + c.phc + '}' : '');
+        /* `auto` counts on the first configuration only, as on Android: the
+         * core configures an input again when it changes. */
+        var first = !n.configured;
+        n.configured = true;
+        if (first && c.auto) {
+            this.stopWaiting(n);
+            this.autoFocus.push(n);
+            this.armed.push(n);
+        }
+    };
+
+    R.stopWaiting = function (n) {
+        var i = this.autoFocus.indexOf(n);
+        if (i >= 0) this.autoFocus.splice(i, 1);
+    };
+
+    /*
+     * The batch's end with `autoFocus` inputs waiting: none takes the focus
+     * while an input is edited or the batch focused something itself (both
+     * newer than the request); else the newest that can take it does
+     * (attached, sized: a `display: none` arrives as a zero frame, not
+     * `visibility: hidden`), and the others keep waiting until it works.
+     */
+    R.focusWaiting = function () {
+        if (this.editing || this.focusRequested) { this.autoFocus = []; return; }
+        for (var k = this.autoFocus.length - 1; k >= 0; k--) {
+            var a = this.autoFocus[k];
+            if (!this.live(a) || !a.input) { this.autoFocus.splice(k, 1); continue; }
+            if (!this.shown(a)) continue;
+            var el = a.input.el;
+            el.focus();
+            if (document.activeElement === el) { this.autoFocus = []; return; }
+        }
+    };
+
+    /* Whether input `n` is on the page with room to take the focus. */
+    R.shown = function (n) {
+        if (!this.attached(n) || !(n.w > 0 && n.h > 0)) return false;
+        var el = n.input.el;
+        return el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
     };
 
     R.setPlaceholderRule = function (id, rule) {
@@ -571,6 +629,10 @@ var NshTizen = (function () {
      * views' own Focus and Blur.
      */
     R.focus = function (n, on) {
+        /* A focus request is newer than any waiting `autoFocus`; a blur
+         * ends that input's wait. */
+        if (on) { this.focusRequested = true; this.autoFocus = []; }
+        else this.stopWaiting(n);
         if (n.input) {
             if (on && this.attached(n)) n.input.el.focus();
             else if (!on) n.input.el.blur();

@@ -235,8 +235,14 @@ also goes to the modal shown last). There are no stacks here (no
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV
 keyboard. It handles value (dropped if the user typed since), placeholder
 and its color, type (`password`, `number`, `email`, `tel`, `url`), max
-length, read only and auto focus (decided at the end of the batch that
-inserts the input, whose configuration follows its insert). A masked input is always one line (a
+length, read only and auto focus. As on Android, auto focus counts on the
+input's first configuration only (not when it moves or is configured
+again) and is tried at the end of the batch, after its insert and frame:
+it does nothing while an input is edited or when the batch focused
+something itself, and an input that is hidden (`visibility: hidden`) or
+unsized (`display: none` arrives as a zero frame) or not yet inserted waits
+until it can take the focus, unless a blur, its removal or a newer focus
+request ends the wait. A masked input is always one line (a
 `<textarea>` cannot hide its text). Changing `multiline` while typing keeps
 the text, the focus and the selection. Focus and blur commands, change and submit
 events, and Focus/Blur all work. Done (65376) submits, and blurs unless the

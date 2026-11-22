@@ -76,7 +76,10 @@ NshTizen.stop();                       // ends the session (a second start does 
 TV, so a layout made for TV points comes out at its intended size. Frames,
 component rects (`ctx.rect()`) and the device the app gets are in points;
 `ctx.scale` gives page pixels per point. The default, 1, lays out in page
-pixels (the test app's 1920 x 1080).
+pixels (the test app's 1920 x 1080). The container is sized in points
+while zoomed and restored when the session ends. A host that passes its
+own `device` must make it agree with `scale`. Text is measured in points
+and drawn zoomed.
 
 Each `start` is a session: a second one ends the first, with its Worker,
 DOM, listeners and callbacks. Every host callback (`onHost`, `onError`,

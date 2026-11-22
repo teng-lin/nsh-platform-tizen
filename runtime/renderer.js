@@ -108,8 +108,9 @@ var NshTizen = (function () {
     };
 
     /* `scale`: page pixels per layout point (the container is zoomed by
-     * it, see page.js); 1 when omitted. */
-    function Renderer(container, send, M, scale) {
+     * it, see page.js), 1 when omitted; `size`: the root's `{w, h}` in
+     * points (default: the container's). */
+    function Renderer(container, send, M, scale, size) {
         this.send = send;
         this.scale = scale > 0 ? scale : 1;
         this.M = M;
@@ -136,10 +137,8 @@ var NshTizen = (function () {
         this.placeholderRules = {};
         this.phStyle = null;
         var root = new Node(ROOT_ID, 'view');
-        /* Zoomed, the window's size in points (the window's own size stays
-         * in page pixels). */
-        root.w = this.scale === 1 ? container.clientWidth || 1920 : (window.innerWidth || 1920) / this.scale;
-        root.h = this.scale === 1 ? container.clientHeight || 1080 : (window.innerHeight || 1080) / this.scale;
+        root.w = size ? size.w : (container.clientWidth || 1920) / this.scale;
+        root.h = size ? size.h : (container.clientHeight || 1080) / this.scale;
         root.restyle();
         this.nodes[ROOT_ID] = root;
         this.container = container;

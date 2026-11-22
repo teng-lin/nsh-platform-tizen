@@ -105,8 +105,23 @@
          * 2. The container is zoomed; the layout, the frames and the
          * device the app sees are in points. */
         this.scale = options.scale > 0 ? options.scale : 1;
-        if (this.scale !== 1) this.container.style.zoom = String(this.scale);
-        this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M, this.scale);
+        /* The screen in points: the container's size before it is zoomed.
+         * Zoomed, the container is sized in points, so that it covers the
+         * same page pixels and nothing of it lies outside the window (the
+         * browser would scroll to a focused input out there). */
+        var cs = this.container.style;
+        this.size = {
+            w: (this.container.clientWidth || window.innerWidth || 1920) / this.scale,
+            h: (this.container.clientHeight || window.innerHeight || 1080) / this.scale
+        };
+        this.restore = null;
+        if (this.scale !== 1) {
+            this.restore = { zoom: cs.zoom, width: cs.width, height: cs.height };
+            cs.width = this.size.w + 'px';
+            cs.height = this.size.h + 'px';
+            cs.zoom = String(this.scale);
+        }
+        this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M, this.scale, this.size);
         /* Its components' errors are the session's (noted once, onError). */
         this.renderer.report = function (text) { self.error(text); };
         /* Metrics are saved before the app leaves. */
@@ -378,8 +393,10 @@
 
     S.start = function () {
         var self = this, options = this.options, M = this.M;
+        /* The device the app sees: the screen in points (a host's own
+         * `device` must agree with its `scale`). */
         var device = options.device ||
-            { width: 1920 / this.scale, height: 1080 / this.scale, pixelRatio: this.scale, dark: true };
+            { width: this.size.w, height: this.size.h, pixelRatio: this.scale, dark: true };
         M.scriptStart = Math.round(performance.now());
         M.ua = navigator.userAgent;
         var module = absolute(options.module || 'app.wasm');
@@ -453,6 +470,12 @@
         clearTimeout(this.saveTimer);
         this.saveNow();
         this.renderer.dispose();
+        /* The container as the host gave it (a later session may not zoom). */
+        if (this.restore) {
+            var cs = this.container.style;
+            cs.zoom = this.restore.zoom; cs.width = this.restore.width; cs.height = this.restore.height;
+            this.restore = null;
+        }
         this.waiting = {};
     };
 

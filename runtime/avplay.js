@@ -189,13 +189,16 @@ NshTizen.avplay = (function () {
              * size; the rect is in points (ctx.scale page pixels each). */
             var k = 1920 / (window.innerWidth || 1920) * (ctx.scale || 1);
             var r = rect && rect.visible ? rect : { x: 0, y: 0, width: 1, height: 1 };
-            /* The method first, FULL_SCREEN: on a 2020 TV (UN55TU7000,
-             * Tizen 5.5) the default letterbox in a rect smaller than the
-             * screen shows no picture while the sound plays. */
-            try {
-                p.setDisplayMethod('PLAYER_DISPLAY_MODE_FULL_SCREEN');
-                p.setDisplayRect(Math.round(r.x * k), Math.round(r.y * k), Math.max(1, Math.round(r.width * k)), Math.max(1, Math.round(r.height * k)));
-            } catch (e) { /* not open */ }
+            var x = Math.round(r.x * k), y = Math.round(r.y * k);
+            var w = Math.max(1, Math.round(r.width * k)), h = Math.max(1, Math.round(r.height * k));
+            /* The method first. The whole screen keeps LETTER_BOX (a 4:3
+             * stream is not stretched); a smaller rect takes FULL_SCREEN,
+             * which fills the rect: on a 2020 TV (UN55TU7000, Tizen 5.5)
+             * LETTER_BOX there shows no picture while the sound plays. */
+            var method = x <= 0 && y <= 0 && w >= 1920 && h >= 1080 ?
+                'PLAYER_DISPLAY_MODE_LETTER_BOX' : 'PLAYER_DISPLAY_MODE_FULL_SCREEN';
+            try { p.setDisplayMethod(method); } catch (e) { /* not open, or a firmware without it */ }
+            try { p.setDisplayRect(x, y, w, h); } catch (e) { /* not open */ }
         }
 
         /* The play/pause state the app asks for, once no seek runs: play

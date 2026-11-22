@@ -215,7 +215,7 @@
         var order = f.calls.filter(function (c) { return c !== 'getCurrentStreamInfo'; }).join(',');
         check(order === 'open,setTimeoutForBuffering,setDisplayMethod,setDisplayRect,setListener,prepareAsync,setDisplayMethod,setDisplayRect,play',
             'AVPlay calls in order: ' + order);
-        check(f.method === 'PLAYER_DISPLAY_MODE_FULL_SCREEN', 'the display method is FULL_SCREEN: ' + f.method);
+        check(f.method === 'PLAYER_DISPLAY_MODE_FULL_SCREEN', 'a rect smaller than the screen takes FULL_SCREEN: ' + f.method);
         rectAt1 = f.rect;
         check(events().indexOf('state {"state":"ready"}') >= 0, 'ready is reported');
         /* A new source: the old one's late callbacks do nothing. */
@@ -237,6 +237,14 @@
         f.prepared.ok();
         var doubled = rectAt1 && f.rect && f.rect.every(function (v, i) { return v === rectAt1[i] * 2; });
         check(doubled, 'at scale 2 the rect is twice the scale-1 one: ' + JSON.stringify([rectAt1, f.rect]));
+        /* The whole screen (960 x 540 points at scale 2) keeps LETTER_BOX. */
+        r.apply([['f', 50, 0, 0, 960, 540]]);
+        check(f.method === 'PLAYER_DISPLAY_MODE_LETTER_BOX' && f.rect.join() === '0,0,1920,1080',
+            'the whole screen takes LETTER_BOX: ' + f.method + ' ' + f.rect);
+        /* A method the firmware refuses does not lose the rect. */
+        f.api.setDisplayMethod = function () { throw new Error('no method'); };
+        r.apply([['f', 50, 10, 10, 100, 100]]);
+        check(f.rect.join() === '20,20,200,200', 'a refused method still places the rect: ' + f.rect);
     }, 2);
 
     withFake(function (f, r, events) {

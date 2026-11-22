@@ -120,7 +120,6 @@ pub fn Guide() -> impl IntoElement {
             "MediaPlay" => paused.set(false),
             "MediaStop" => playing.set(None),
             "ColorF0Red" => search.focus(),
-            "GoBack" => nsh_platform_tizen::host(r#"{"exit":true}"#),
             _ => {}
         }
     };

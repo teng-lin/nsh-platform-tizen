@@ -75,6 +75,9 @@ pub fn shown(item: &MountItem) -> bool {
                 | nsh_core::Command::ScrollTo { .. }
                 | nsh_core::Command::Native { .. }
                 | nsh_core::Command::ExitApp
+                // The back button's default, done where the batch is
+                // encoded (`Outbox::back`).
+                | nsh_core::Command::Back
         ),
         M::Create { .. }
         | M::Insert { .. }

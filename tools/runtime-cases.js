@@ -566,6 +566,88 @@
         });
     });
 
+    /* `autoFocus`, as Android's InputBox: armed by an input's first
+     * configuration (after its insert in the batch that mounts it), it
+     * takes the DOM focus (the TV keyboard) at the batch's end, unless an
+     * input is edited or the batch focused something; a hidden or unsized
+     * input waits until it is shown; a blur, a removal or a newer focus
+     * ends the wait. At the page's scales 1 and 2 (a zoomed container). */
+    [1, 2].forEach(function (scale) {
+        later.push(function () {
+            var box = document.createElement('div');
+            /* Focusable: not `visibility: hidden`. */
+            box.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px;opacity:0;zoom:' + scale;
+            document.body.appendChild(box);
+            var sent = [];
+            var r = new NshTizen.Renderer(box, function (m) { sent.push(m); }, metrics(), scale);
+            var at = ' (scale ' + scale + ')';
+            var config = function (auto, ph) { return { css: '', ph: ph || '', type: 'text', ml: false, max: -1, off: false, submit: 'keep', auto: auto }; };
+            var el = function (id) { return r.nodes[id].input.el; };
+            var active = function () { return document.activeElement && document.activeElement.id; };
+            var blur = function () { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); };
+            /* An input mounted as the core mounts it: create, insert,
+             * frame, then its configuration. */
+            var input = function (id, parent, auto, w) {
+                return [['c', id, 'input'], ['i', parent, id, null], ['f', id, 0, 0, w === undefined ? 200 : w, 40], ['in', id, config(auto)]];
+            };
+
+            r.apply([['c', 72, 'view'], ['f', 72, 0, 0, 400, 400]].concat(input(73, 72, true), input(74, 72, false), [['i', 1, 72, null]]));
+            check(document.activeElement === el(73), 'the auto-focused input has the DOM focus' + at + ': ' + active());
+            check(r.editing === r.nodes[73] && sent.some(function (m) { return m.t === 'focus' && m.id === 73 && m.on === 1; }),
+                'and the app hears it is edited' + at);
+
+            blur();
+            r.apply([['i', 1, 73, null]]);
+            r.apply([['in', 73, config(true, 'again')]]);
+            check(document.activeElement !== el(73), 'a moved or reconfigured auto-focus input does not take the focus again' + at + ': ' + active());
+
+            el(74).focus();
+            r.apply(input(75, 72, true));
+            check(document.activeElement === el(74), 'an input being edited keeps the focus' + at + ': ' + active());
+            blur();
+            r.apply([['f', 75, 0, 0, 210, 40]]);
+            check(document.activeElement !== el(75), 'and the auto focus it kept from does not come later' + at + ': ' + active());
+
+            r.apply(input(76, 72, true).concat(input(77, 72, false), [['fo', 77, true]]));
+            check(document.activeElement === el(77), 'an explicit focus in the same batch wins' + at + ': ' + active());
+            blur();
+
+            r.apply(input(78, 72, true, 0));
+            check(document.activeElement !== el(78), 'an unsized (display: none) auto-focus input waits' + at + ': ' + active());
+            r.apply([['f', 78, 0, 0, 200, 40]]);
+            check(document.activeElement === el(78), 'and takes the focus once it is shown' + at + ': ' + active());
+            blur();
+
+            r.apply([['c', 79, 'view'], ['f', 79, 0, 0, 400, 400], ['s', 79, 'visibility:hidden;'], ['i', 1, 79, null]].concat(input(80, 79, true)));
+            check(document.activeElement !== el(80), 'a visibility: hidden auto-focus input waits' + at + ': ' + active());
+            r.apply([['s', 79, '']]);
+            check(document.activeElement === el(80), 'and takes the focus once visible' + at + ': ' + active());
+            blur();
+
+            r.apply([['c', 81, 'input'], ['in', 81, config(true)]]);
+            check(document.activeElement !== el(81), 'an input not inserted takes no focus' + at);
+            r.apply([['i', 72, 81, null], ['f', 81, 0, 0, 200, 40]]);
+            check(document.activeElement === el(81), 'until it is' + at + ': ' + active());
+            blur();
+
+            r.apply(input(82, 72, true, 0));
+            r.apply([['fo', 82, false], ['f', 82, 0, 0, 200, 40]]);
+            check(document.activeElement !== el(82), 'a blur ends the wait' + at + ': ' + active());
+            r.apply(input(83, 72, true, 0));
+            r.apply([['r', 83]]);
+            r.apply([['i', 72, 83, null], ['f', 83, 0, 0, 200, 40]]);
+            check(document.activeElement !== el(83), 'so does a removal' + at + ': ' + active());
+            r.apply(input(84, 72, true, 0));
+            r.apply([['c', 85, 'view'], ['i', 72, 85, null], ['fo', 85, true]]);
+            r.apply([['f', 84, 0, 0, 200, 40]]);
+            check(document.activeElement !== el(84), 'and a newer focus request' + at + ': ' + active());
+            check(r.autoFocus.length === 0, 'nothing is left waiting' + at + ': ' + r.autoFocus.length);
+            r.dispose();
+            box.parentNode.removeChild(box);
+            return Promise.resolve();
+        });
+    });
+
     /* An app OK whose press focused an input: its repeats reach the page's
      * handler (still the app's), and its release is sent. */
     later.push(function () {

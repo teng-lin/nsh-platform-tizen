@@ -216,14 +216,35 @@ Volume, Menu and Source stay the TV's. `code` is the browser's
 `KeyboardEvent.code`. No `default_prevented`: the page can't wait for the
 Worker, so it prevents the default of every key in the table.
 
-Not done: Back reaches the app only as the raw `GoBack` key; there is no
-NSH back handling (`onBackRequest`, `onRequestClose`, `popOnBack`) behind
-it yet.
+Back is also the back button, as on Android: it is a system key, which no
+`captureKeys` rule takes, not even `all`. The app hears its press, repeats
+and release as `GoBack` keys (`defaultPrevented` false), and the release
+of a press is the back button, even when the release reaches no view
+(only an app's `onBackPress` that takes it, as Patina's `swallow_back`
+does, keeps it from going further). The release is
+committed first, so the back button acts on what it left (a TV app tells a
+tap from a hold on the release, and may open a confirmation there): the
+modal shown last (presentation order, as Android's, not drawing order)
+gets `onRequestClose` (reason `cancel`) and, with `closeOnEscape` (the
+default), closes here: it leaves the page, `onDismiss` follows, and until
+the app takes it out or shows it again keys and Back go past it (it is not
+asked to close twice). Without a modal the app's `onBackPress` runs while
+it listens, and the app leaves (`Command::ExitApp`'s path, after the other
+effects) when none does or no listener takes it (`Command::Back`, which
+also goes to the modal shown last). There are no stacks here (no
+`popOnBack`, `onBackRequest`).
 
 **Inputs.** An NSH input is an `<input>` (or `<textarea>`) over the TV
 keyboard. It handles value (dropped if the user typed since), placeholder
 and its color, type (`password`, `number`, `email`, `tel`, `url`), max
-length, read only and auto focus. A masked input is always one line (a
+length, read only and auto focus. As on Android, auto focus counts on the
+input's first configuration only (not when it moves or is configured
+again) and is tried at the end of the batch, after its insert and frame:
+it does nothing while an input is edited or when the batch focused
+something itself, and an input that is hidden (`visibility: hidden`) or
+unsized (`display: none` arrives as a zero frame) or not yet inserted waits
+until it can take the focus, unless a blur, its removal or a newer focus
+request ends the wait. A masked input is always one line (a
 `<textarea>` cannot hide its text). Changing `multiline` while typing keeps
 the text, the focus and the selection. Focus and blur commands, change and submit
 events, and Focus/Blur all work. Done (65376) submits, and blurs unless the
@@ -398,7 +419,7 @@ Worker's per-key cost stays in the engine; the renderer halved its share.
 | An opaque background hides AVPlay's video | Followed: transparent down to `body`, the `<object>` first in `body`. The picture couldn't be checked (no screenshots); the player reached `ready` with its size. |
 | AVPlay call order, close after errors, tokens, stop while hidden | Implemented. On the TV: open, prepare, play, pause and zap. Against a fake AVPlay in headless Chromium (`tools/runtime-cases.js`): the call order, late callbacks of a replaced stream dropped, a throwing `play()` and an error both closing and releasing the player, a seek before ready deferred. The hidden path wasn't exercised on the TV (`tizen run` relaunched the app). |
 | Register keys one by one, again when visible; not Exit or Volume | Implemented. The registration worked; re-registration wasn't exercised. |
-| Back debounce (about 600 ms) | Implemented (`backDebounceMs`). Not exercised with a real remote. |
+| Back debounce (about 600 ms) | Implemented (`backDebounceMs`, 0 turns it off; Patina does, as Android has none). Not exercised with a real remote. |
 | IME Done/Cancel are 65376 / 65385; blur when focus leaves | On the TV, with synthetic keys: Done submits without the app also seeing it, Back blurs without reaching the app. |
 | Declaring a CSP switches Tizen to CSP mode | The example app declares one; the Worker, wasm compile, styles, images and AVPlay all work under it on the TV. |
 | About 120 MB JS heap budget | The page uses 10 MB (the Worker's heap isn't measured). |

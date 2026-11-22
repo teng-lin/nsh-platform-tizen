@@ -179,9 +179,51 @@ struct Outbox {
     sent: Sent,
     /// Where keys go, and the focus of views.
     routes: route::Routes,
-    /// Requests this platform cannot serve, answered after the pump:
-    /// an app awaiting one must not wait forever.
-    answers: Vec<(EventKind, EventPayload)>,
+    /// Events for the engine after the pump, by view: answers to requests
+    /// this platform cannot serve (an app awaiting one must not wait
+    /// forever), and a modal's close request and dismissal on
+    /// `Command::Back`.
+    answers: Vec<(u32, EventKind, EventPayload)>,
+}
+
+impl Outbox {
+    /// Does what the back button acts on, as Android's `Mounter`: a
+    /// modal's close request (reason `cancel`), and with `closeOnEscape`
+    /// its closing here (it leaves the page, `r` in `json`, then
+    /// `onDismiss`), or the app's `onBackPress`, go to the engine after the
+    /// pump; leaving is the page's (`x`), appended to the batch `json`
+    /// being built.
+    fn back(&mut self, back: route::Back, json: &mut String) {
+        use nsh_core::PayloadValue as V;
+        match back {
+            route::Back::Modal(id) => {
+                self.answers.push((
+                    id,
+                    EventKind::RequestClose,
+                    EventPayload::Map(vec![("reason", V::Str("cancel".into()))]),
+                ));
+                if self.routes.closes_on_escape(id) {
+                    self.routes.close_modal(id);
+                    push(json, &serde_json::json!(["r", id]).to_string());
+                    self.answers
+                        .push((id, EventKind::Dismiss, EventPayload::None));
+                }
+            }
+            route::Back::App => {
+                self.answers
+                    .push((nsh_core::ROOT_ID, EventKind::BackPress, EventPayload::None))
+            }
+            route::Back::Exit => push(
+                json,
+                &encode::item(&nsh_core::MountItem::Command {
+                    id: nsh_core::ROOT_ID,
+                    command: nsh_core::Command::ExitApp,
+                })
+                .expect("ExitApp is shown")
+                .to_string(),
+            ),
+        }
+    }
 }
 
 /// Hashes of the last `s` and `t` operation per view, and the in-memory
@@ -327,8 +369,17 @@ impl MountSink for Sink {
             if let Some((id, now)) = in_memory(item) {
                 released.extend(outbox.sent.show(id, now, &mut images));
             }
-            if let Some(answer) = answer(item) {
-                outbox.answers.push(answer);
+            if let Some((kind, payload)) = answer(item) {
+                outbox.answers.push((nsh_core::ROOT_ID, kind, payload));
+            }
+            // `Command::Back`: no listener took the back button.
+            if let nsh_core::MountItem::Command {
+                command: nsh_core::Command::Back,
+                ..
+            } = item
+            {
+                let back = outbox.routes.default_back();
+                outbox.back(back, &mut json);
             }
             match encode::item(item) {
                 Some(op) => {
@@ -458,6 +509,10 @@ pub struct Runtime<M: Measure + 'static> {
     outbox: Arc<Mutex<Outbox>>,
     /// The last key transition's capture decision.
     captured: bool,
+    /// Back's press went to the app: its release is the back button,
+    /// whatever the app's listeners do with the keys (Back is a system
+    /// key, as on Android).
+    back_held: bool,
 }
 
 impl<M: Measure + 'static> Runtime<M> {
@@ -483,6 +538,7 @@ impl<M: Measure + 'static> Runtime<M> {
             control,
             outbox,
             captured: false,
+            back_held: false,
         })
     }
 
@@ -545,9 +601,8 @@ impl<M: Measure + 'static> Runtime<M> {
             self.control.animations_finished(finished);
         }
         self.transitions(transitions);
-        for (kind, payload) in answers {
-            self.control
-                .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+        for (id, kind, payload) in answers {
+            self.control.dispatch_event(id, kind, payload);
         }
         any
     }
@@ -671,6 +726,15 @@ impl<M: Measure + 'static> Runtime<M> {
         } else {
             EventKind::KeyUp
         };
+        // Back is a system key, as on Android (`KeyCaptures.captured`): no
+        // `captureKeys` rule takes it, not even `all`. The app still hears
+        // it, with `default_prevented` false, routed as any key.
+        if key == keys::BACK {
+            self.control
+                .dispatch_event(id, kind, EventPayload::Key(event));
+            self.captured = false;
+            return false;
+        }
         // The engine's own entry for a key (`#[doc(hidden)]` in NSH; its web
         // backend uses it too): it sets `default_prevented` from the
         // mounted `captureKeys` rules (the page cannot wait for that
@@ -694,7 +758,10 @@ impl<M: Measure + 'static> Runtime<M> {
     /// being edited. OK on a focused view that takes presses is a key
     /// there and, when the app's `captureKeys` did not take it, presses it.
     /// Repeats go where keys go now; the release to the views the last
-    /// down reached ([`route`]).
+    /// down reached ([`route`]). Back is a system key that no
+    /// `captureKeys` takes; the release of its press is also the back
+    /// button, after the release is committed, on what that left
+    /// ([`route::Routes::back`]).
     pub fn remote_key(
         &mut self,
         id: u32,
@@ -724,7 +791,55 @@ impl<M: Measure + 'static> Runtime<M> {
             }
             route::Route::Drop => {}
         }
-        self.pump()
+        if key != keys::BACK {
+            return self.pump();
+        }
+        // The back button, as Android's: the release of a press the app
+        // got goes back, whatever its listeners did with the press, its
+        // repeats and the release (nothing captures Back, and this
+        // platform has no shortcuts that could consume it), and even when
+        // the release reaches no view. A release without its press does
+        // not.
+        if down {
+            if !repeat {
+                self.back_held = true;
+            }
+            return self.pump();
+        }
+        if !std::mem::take(&mut self.back_held) {
+            return self.pump();
+        }
+        // The release goes first and its effects are committed (a TV app
+        // tells a tap from a hold on it, and may open a confirmation or
+        // start listening to `onBackPress` there); the back button then
+        // acts on the routes those commits left, and its own effects
+        // follow. Leaving comes last.
+        let mut pumped = self.pump();
+        let mut leave = String::new();
+        {
+            let mut outbox = self.lock();
+            let back = outbox.routes.back();
+            let mut ops = String::new();
+            match back {
+                route::Back::Exit => outbox.back(back, &mut leave),
+                _ => outbox.back(back, &mut ops),
+            }
+            // Outside a batch: a view focused in a modal closed here loses
+            // the focus now.
+            outbox.routes.end_batch();
+            if !ops.is_empty() {
+                outbox.batches.push(Batch::ops(format!("[{ops}]")));
+            }
+        }
+        let after = self.pump();
+        pumped.batches.extend(after.batches);
+        pumped.frame |= after.frame;
+        pumped.next = after.next;
+        pumped.errors.extend(after.errors);
+        if !leave.is_empty() {
+            pumped.batches.push(Batch::ops(format!("[{leave}]")));
+        }
+        pumped
     }
 
     /// Native component `id` emitted `name` with `data`.
@@ -1565,6 +1680,339 @@ mod tests {
         runtime.remote_key(0, 49, "1", "", false, false);
         let ok = runtime.remote_key(0, 13, "", "", true, false);
         assert_eq!(texts(&ok), ["Enter true false"], "captured: no press");
+    }
+
+    #[component]
+    fn BackSteps() -> impl IntoElement {
+        let heard = signal(String::new());
+        let add = move |what: &str| heard.update(|h| h.push_str(what));
+        on_back_press(move || {
+            add(" back");
+            true
+        });
+        view()
+            .on_key_down(move |e: &KeyEvent| add(if e.repeat { " repeat" } else { " down" }))
+            .on_key_up(move |_: &KeyEvent| add(" up"))
+            .child(text(move || heard.get()))
+    }
+
+    /// Back is the back button on its release, after the app heard the
+    /// release (as on Android), once per press.
+    #[test]
+    fn back_goes_back_on_its_release() {
+        let (mut runtime, first) = start(Root::of::<BackSteps>());
+        assert!(
+            first
+                .iter()
+                .any(|op| op[0] == "e" && op[1] == nsh_core::ROOT_ID),
+            "the root listens to the back button: {first:?}"
+        );
+        assert_eq!(
+            texts(&runtime.remote_key(0, 10009, "", "", true, false)),
+            [" down"]
+        );
+        assert_eq!(
+            texts(&runtime.remote_key(0, 10009, "", "", true, true)),
+            [" down repeat"]
+        );
+        // The release, then the back button.
+        assert_eq!(
+            texts(&runtime.remote_key(0, 10009, "", "", false, false)),
+            [" down repeat up", " down repeat up back"]
+        );
+        // A release without its press is nobody's.
+        assert!(texts(&runtime.remote_key(0, 10009, "", "", false, false)).is_empty());
+        // Another key goes nowhere back.
+        runtime.remote_key(0, 13, "", "", true, false);
+        assert_eq!(
+            texts(&runtime.remote_key(0, 13, "", "", false, false)),
+            [" down repeat up back down up"]
+        );
+    }
+
+    /// Whether the ops leave the app (`x`).
+    fn exits(ops: &[Value]) -> bool {
+        ops.iter().any(|op| op[0] == "x")
+    }
+
+    /// A Back press and release, all ops of both.
+    fn back(runtime: &mut Runtime<ApproxMeasure>) -> Vec<Value> {
+        let mut all = ops(&runtime.remote_key(0, 10009, "", "", true, false));
+        all.extend(ops(&runtime.remote_key(0, 10009, "", "", false, false)));
+        all
+    }
+
+    /// A Back the app's `onBackPress` takes does not leave.
+    #[test]
+    fn a_handled_back_does_not_leave() {
+        let (mut runtime, _) = start(Root::of::<BackSteps>());
+        let all = back(&mut runtime);
+        assert_eq!(
+            texts_of(&all).last().map(String::as_str),
+            Some(" down up back")
+        );
+        assert!(!exits(&all), "{all:?}");
+    }
+
+    /// Two modals that only ask to close (`closeOnEscape` off): "2" opens
+    /// the first one declared, "3" the second, so opening "3" then "2"
+    /// shows the first declared last, drawn below the other.
+    #[component]
+    fn TwoModals() -> impl IntoElement {
+        let heard = signal(String::new());
+        let a = signal(false);
+        let b = signal(false);
+        let dialog = move |name: &'static str| {
+            nsh_core::element::modal()
+                .close_on_escape(false)
+                .on_cancel(move || heard.update(|h| h.push_str(&format!(" {name}"))))
+                .child(view().w(px(10.0)).h(px(10.0)))
+        };
+        view()
+            .on_key_down(move |e: &KeyEvent| match &*e.key {
+                "2" => a.set(true),
+                "3" => b.set(true),
+                _ => {}
+            })
+            .child(text(move || heard.get()))
+            .child(when(a, move || dialog("a")))
+            .child(when(b, move || dialog("b")))
+    }
+
+    fn open_b_then_a(runtime: &mut Runtime<ApproxMeasure>) {
+        for code in [51, 50] {
+            runtime.remote_key(0, code, "", "", true, false);
+            runtime.remote_key(0, code, "", "", false, false);
+        }
+    }
+
+    /// The back button goes to the modal shown last (as Android's
+    /// `shownModals`), not the one drawn on top; one that does not close
+    /// on Escape is only asked to, each time.
+    #[test]
+    fn back_goes_to_the_newest_modal_shown() {
+        let (mut runtime, _) = start(Root::of::<TwoModals>());
+        open_b_then_a(&mut runtime);
+        let all = back(&mut runtime);
+        assert_eq!(texts_of(&all), [" a"], "{all:?}");
+        assert!(!exits(&all) && !all.iter().any(|op| op[0] == "r"));
+        let all = back(&mut runtime);
+        assert_eq!(texts_of(&all), [" a a"], "asked again: it stays open");
+    }
+
+    #[component]
+    fn ClosingModal() -> impl IntoElement {
+        let heard = signal(String::new());
+        let add = move |what: &'static str| heard.update(|h| h.push_str(what));
+        on_back_press(move || {
+            add(" back");
+            true
+        });
+        // The app does not take the modal out when it closes.
+        view().child(text(move || heard.get())).child(
+            nsh_core::element::modal()
+                .test_id("modal")
+                .on_cancel(move || add(" cancel"))
+                .on_close(move || add(" close"))
+                .child(
+                    view()
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .on_key_down(move |_: &KeyEvent| add(" key")),
+                ),
+        )
+    }
+
+    /// A modal that closes on Escape (the default) closes on Back here,
+    /// as on Android: off the page, its close request then its dismissal
+    /// reported; while the app has not taken it out, Back and keys go past
+    /// it, and it is asked to close only once.
+    #[test]
+    fn back_closes_a_modal_that_closes_on_escape() {
+        let (mut runtime, first) = start(Root::of::<ClosingModal>());
+        let (_, modal) = first
+            .iter()
+            .find(|op| op[0] == "vp" && op[3] == "modal")
+            .map(|op| (op, op[1].as_u64().unwrap() as u32))
+            .expect("the modal's test id");
+        let all = back(&mut runtime);
+        assert!(
+            all.iter().any(|op| op == &serde_json::json!(["r", modal])),
+            "{all:?}"
+        );
+        // Its content heard the press, as a modal's content hears keys.
+        assert_eq!(
+            texts_of(&all).last().map(String::as_str),
+            Some(" key cancel close")
+        );
+        assert_eq!(runtime.key_target(), nsh_core::ROOT_ID, "keys go past it");
+        let all = back(&mut runtime);
+        assert_eq!(
+            texts_of(&all).last().map(String::as_str),
+            Some(" key cancel close back"),
+            "not asked to close again: {all:?}"
+        );
+        assert!(!exits(&all));
+    }
+
+    #[component]
+    fn ConfirmOnRelease() -> impl IntoElement {
+        let heard = signal(String::new());
+        let open = signal(false);
+        view()
+            .on_key_up(move |e: &KeyEvent| {
+                if &*e.key == "GoBack" {
+                    open.set(true);
+                }
+            })
+            .child(text(move || heard.get()))
+            .child(when(open, move || {
+                nsh_core::element::modal()
+                    .close_on_escape(false)
+                    .on_cancel(move || heard.update(|h| h.push_str("confirm")))
+                    .child(view().w(px(10.0)).h(px(10.0)))
+            }))
+    }
+
+    /// The release's own effects come first: a confirmation it opens is
+    /// what the back button asks to close, and the app does not leave.
+    #[test]
+    fn back_acts_on_what_its_release_mounted() {
+        let (mut runtime, _) = start(Root::of::<ConfirmOnRelease>());
+        let all = back(&mut runtime);
+        assert_eq!(texts_of(&all), ["confirm"], "{all:?}");
+        assert!(!exits(&all), "{all:?}");
+    }
+
+    /// Back's press reached views all gone at its release (the root's
+    /// content replaced, as a new root does): the release is dropped, and
+    /// the back button still goes, its press having gone to the app.
+    #[test]
+    fn back_goes_back_when_its_release_reaches_no_view() {
+        let (mut runtime, first) = start(Root::of::<BackSteps>());
+        let content = first
+            .iter()
+            .find(|op| op[0] == "i" && op[1] == nsh_core::ROOT_ID)
+            .and_then(|op| op[2].as_u64())
+            .expect("the root's content") as u32;
+        runtime.remote_key(0, 10009, "", "", true, false);
+        {
+            let mut outbox = runtime.lock();
+            outbox
+                .routes
+                .apply(&nsh_core::MountItem::Remove { id: content });
+            outbox.routes.apply(&nsh_core::MountItem::Insert {
+                parent: nsh_core::ROOT_ID,
+                child: 999,
+                before: None,
+            });
+        }
+        let up = ops(&runtime.remote_key(0, 10009, "", "", false, false));
+        assert_eq!(
+            texts_of(&up),
+            [" down back"],
+            "no release, then back: {up:?}"
+        );
+        assert!(!exits(&up));
+    }
+
+    #[component]
+    fn NoBack() -> impl IntoElement {
+        let heard = signal(String::new());
+        view()
+            .on_key_up(move |e: &KeyEvent| heard.set(format!("up {}", e.key)))
+            .child(text(move || heard.get()))
+    }
+
+    /// Without a listener Back leaves the app (`Command::Back` without
+    /// stacks), as Android's does; a listener that does not take it lets
+    /// the core send `Command::Back`, which leaves too.
+    #[test]
+    fn back_without_a_listener_leaves() {
+        let (mut runtime, _) = start(Root::of::<NoBack>());
+        let down = ops(&runtime.remote_key(0, 10009, "", "", true, false));
+        assert!(!down.iter().any(|op| op[0] == "x"), "not on the press");
+        let up = ops(&runtime.remote_key(0, 10009, "", "", false, false));
+        assert_eq!(texts_of(&up), ["up GoBack"]);
+        assert_eq!(up.last(), Some(&serde_json::json!(["x", 1])), "{up:?}");
+    }
+
+    #[component]
+    fn BackDeclined() -> impl IntoElement {
+        on_back_press(|| false);
+        view().w(px(10.0)).h(px(10.0))
+    }
+
+    #[test]
+    fn a_back_no_listener_takes_leaves() {
+        let (mut runtime, _) = start(Root::of::<BackDeclined>());
+        runtime.remote_key(0, 10009, "", "", true, false);
+        let up = ops(&runtime.remote_key(0, 10009, "", "", false, false));
+        assert!(
+            up.iter().any(|op| op == &serde_json::json!(["x", 1])),
+            "{up:?}"
+        );
+    }
+
+    #[component]
+    fn BackCaptured() -> impl IntoElement {
+        let heard = signal(String::new());
+        let add = move |what: String| heard.update(|h| h.push_str(&what));
+        on_back_press(move || {
+            add(" back".into());
+            true
+        });
+        let seen = move |name: &str, e: &KeyEvent| {
+            if &*e.key == "GoBack" {
+                add(format!(" {name} {}", e.default_prevented));
+            }
+        };
+        view()
+            .capture_keys(nsh_core::KeyCapture::All)
+            .on_key_down(move |e: &KeyEvent| seen(if e.repeat { "repeat" } else { "down" }, e))
+            .on_key_up(move |e: &KeyEvent| seen("up", e))
+            .child(text(move || heard.get()))
+    }
+
+    /// Back is a system key, as on Android: `captureKeys`, even `all`,
+    /// takes none of its transitions; the app still hears each (not
+    /// prevented), and its release is the back button.
+    #[test]
+    fn capture_keys_never_takes_back() {
+        let (mut runtime, _) = start(Root::of::<BackCaptured>());
+        runtime.remote_key(0, 10009, "", "", true, false);
+        assert!(!runtime.key_captured());
+        runtime.remote_key(0, 10009, "", "", true, true);
+        assert!(!runtime.key_captured());
+        let up = ops(&runtime.remote_key(0, 10009, "", "", false, false));
+        assert!(!runtime.key_captured());
+        assert_eq!(
+            texts_of(&up),
+            [
+                " down false repeat false up false",
+                " down false repeat false up false back"
+            ],
+            "{up:?}"
+        );
+        assert!(!exits(&up));
+        // Other keys stay the rule's.
+        runtime.remote_key(0, 13, "", "", true, false);
+        assert!(runtime.key_captured());
+    }
+
+    /// The texts of ops already decoded.
+    fn texts_of(ops: &[Value]) -> Vec<String> {
+        ops.iter()
+            .filter(|op| op[0] == "t")
+            .flat_map(|op| {
+                op[2]["runs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| l[0].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[component]

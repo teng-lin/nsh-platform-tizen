@@ -97,7 +97,7 @@ pub(crate) struct Routes {
     /// The focused view (not an input).
     focused: Option<u32>,
     /// The input being edited (its DOM focus), as the page reported it.
-    pub(crate) editing: Option<u32>,
+    editing: Option<u32>,
     /// Focus transitions to report: view, focused.
     pub(crate) transitions: Vec<(u32, bool)>,
     /// Each held key: its route's family and the views its last down
@@ -195,7 +195,7 @@ impl Routes {
         }
     }
 
-    /// The end of a batch: a focused view no longer in the tree (it, or an
+    /// The end of a batch: a focused view or input no longer in the tree (it, or an
     /// ancestor, was detached; a move within the batch is not a removal)
     /// loses the focus.
     pub(crate) fn end_batch(&mut self) {
@@ -203,6 +203,12 @@ impl Routes {
             && !self.attached(f)
         {
             self.focus_view(None);
+        }
+        if let Some(input) = self.editing
+            && !self.attached(input)
+        {
+            self.editing = None;
+            self.transitions.push((input, false));
         }
     }
 
@@ -224,15 +230,20 @@ impl Routes {
         }
     }
 
-    /// An input took the DOM focus: the focused view loses it (reported
-    /// before the input's own Focus).
-    pub(crate) fn input_focused(&mut self, id: u32) {
+    /// An attached input took the DOM focus: the focused view loses it
+    /// before the input's own Focus. A delayed Focus from a detached input
+    /// leaves the current focus alone.
+    pub(crate) fn input_focused(&mut self, id: u32) -> bool {
+        if !self.attached(id) {
+            return false;
+        }
         self.focus_view(None);
         self.editing = Some(id);
+        true
     }
 
     /// An input lost the DOM focus; false when its Blur was reported
-    /// already (a view took the focus from it).
+    /// already (the input detached or a view took the focus from it).
     pub(crate) fn input_blurred(&mut self, id: u32) -> bool {
         if self.editing == Some(id) {
             self.editing = None;
@@ -314,7 +325,7 @@ impl Routes {
     /// The back button closed modal `id` here: until the core inserts it
     /// again or takes it out, it is off the page and out of the tree for
     /// keys and Back (a second Back goes past it, as Android's
-    /// `modalClosed`); a view focused in it loses the focus at the next
+    /// `modalClosed`); anything focused in it loses the focus at the next
     /// [`Self::end_batch`].
     pub(crate) fn close_modal(&mut self, id: u32) {
         self.closing.insert(id);
@@ -341,7 +352,7 @@ impl Routes {
     }
 
     fn fresh(&self, enter: bool, requested: u32) -> Route {
-        if requested != 0 {
+        if requested != 0 && self.attached(requested) {
             return Route::Key(requested);
         }
         let target = self.target();
@@ -531,7 +542,7 @@ mod tests {
             kind: ViewKind::Input,
         });
         insert(&mut r, 2, 20);
-        r.input_focused(20);
+        assert!(r.input_focused(20));
         focus(&mut r, 4);
         assert_eq!(r.transitions, [(20, false), (4, true)]);
         assert!(!r.input_blurred(20), "its Blur was reported already");

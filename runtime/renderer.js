@@ -123,9 +123,9 @@ var NshTizen = (function () {
         /* `autoFocus` inputs waiting to take the DOM focus, oldest first:
          * armed by an input's first configuration (as Android's InputBox),
          * tried at each batch's end until one can take it (shown, sized),
-         * dropped on its blur or removal or a newer focus request. */
+         * dropped on a blur of its subtree, removal or a newer focus request. */
         this.autoFocus = [];
-        this.armed = [];          /* those armed in this batch */
+        this.detachedAutoFocus = new Set(); /* pending inputs removed in this batch */
         this.focusRequested = false; /* a `fo` focus ran in this batch */
         this.disposed = false;
         /* Each held key's disposition, decided at its press: 'app' (sent
@@ -231,7 +231,7 @@ var NshTizen = (function () {
          * comes after its insert in the batch that mounts it, and its
          * frame may come later still. */
         if (this.autoFocus.length) this.focusWaiting();
-        this.armed = [];
+        this.detachedAutoFocus.clear();
         this.focusRequested = false;
         M.batches++;
         M.ops += ops.length;
@@ -264,18 +264,15 @@ var NshTizen = (function () {
         this.placed = true;
     };
 
-    /* A detached subtree keeps no DOM focus: the TV keyboard closes; an
-     * input in it waiting for the focus stops waiting (one armed in this
-     * batch has not waited yet). */
+    /* A detached subtree keeps no DOM focus: the TV keyboard closes.
+     * Wait until the batch ends to see if its pending inputs moved. */
     R.detach = function (n) {
         if (n.el.parentNode) n.el.parentNode.removeChild(n.el);
         n.parent = null;
         if (this.editing && !this.attached(this.editing)) this.editing.input.el.blur();
-        if (this.autoFocus.length) {
-            var self = this;
-            this.autoFocus = this.autoFocus.filter(function (a) {
-                return self.armed.indexOf(a) >= 0 || !self.within(a, n);
-            });
+        for (var i = 0; i < this.autoFocus.length; i++) {
+            var input = this.autoFocus[i];
+            if (this.within(input, n)) this.detachedAutoFocus.add(input);
         }
         this.placed = true;
     };
@@ -563,7 +560,6 @@ var NshTizen = (function () {
         if (first && c.auto) {
             this.stopWaiting(n);
             this.autoFocus.push(n);
-            this.armed.push(n);
         }
     };
 
@@ -583,7 +579,10 @@ var NshTizen = (function () {
         if (this.editing || this.focusRequested) { this.autoFocus = []; return; }
         for (var k = this.autoFocus.length - 1; k >= 0; k--) {
             var a = this.autoFocus[k];
-            if (!this.live(a) || !a.input) { this.autoFocus.splice(k, 1); continue; }
+            if (!this.live(a) || (this.detachedAutoFocus.has(a) && !this.attached(a))) {
+                this.autoFocus.splice(k, 1);
+                continue;
+            }
             if (!this.shown(a)) continue;
             var el = a.input.el;
             el.focus();
@@ -629,10 +628,15 @@ var NshTizen = (function () {
      * views' own Focus and Blur.
      */
     R.focus = function (n, on) {
-        /* A focus request is newer than any waiting `autoFocus`; a blur
-         * ends that input's wait. */
-        if (on) { this.focusRequested = true; this.autoFocus = []; }
-        else this.stopWaiting(n);
+        if (on) {
+            this.focusRequested = true;
+            this.autoFocus = [];
+        } else if (n.id === ROOT_ID) {
+            this.autoFocus = [];
+        } else if (this.autoFocus.length) {
+            var self = this;
+            this.autoFocus = this.autoFocus.filter(function (input) { return !self.within(input, n); });
+        }
         if (n.input) {
             if (on && this.attached(n)) n.input.el.focus();
             else if (!on) n.input.el.blur();

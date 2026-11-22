@@ -666,7 +666,11 @@ impl<M: Measure + 'static> Runtime<M> {
     /// ([`nsh_core::MountItem::TrackStates`], `nsh_core::tailwind::state`
     /// bits): pressed, focused.
     pub fn states(&mut self, id: u32, states: u16) -> Pumped {
-        self.control.set_states(id, states);
+        // The page can still send its input's state after Back closed the
+        // modal and a different view took the focus.
+        if self.lock().routes.attached(id) {
+            self.control.set_states(id, states);
+        }
         self.pump()
     }
 
@@ -755,8 +759,9 @@ impl<M: Measure + 'static> Runtime<M> {
     /// reported as `dom_key` / `dom_code`, with the DOM's name for it
     /// ([`keys::key_name`]). `id` 0 lets the platform choose its view
     /// ([`Runtime::key_target`]); the page names one only for the input
-    /// being edited. OK on a focused view that takes presses is a key
-    /// there and, when the app's `captureKeys` did not take it, presses it.
+    /// being edited, which must still be attached. OK on a focused view
+    /// that takes presses is a key there and, when the app's
+    /// `captureKeys` did not take it, presses it.
     /// Repeats go where keys go now; the release to the views the last
     /// down reached ([`route`]). Back is a system key that no
     /// `captureKeys` takes; the release of its press is also the back
@@ -824,7 +829,7 @@ impl<M: Measure + 'static> Runtime<M> {
                 route::Back::Exit => outbox.back(back, &mut leave),
                 _ => outbox.back(back, &mut ops),
             }
-            // Outside a batch: a view focused in a modal closed here loses
+            // Outside a batch: anything focused in a modal closed here loses
             // the focus now.
             outbox.routes.end_batch();
             if !ops.is_empty() {
@@ -855,19 +860,22 @@ impl<M: Measure + 'static> Runtime<M> {
         self.pump()
     }
 
-    /// Input `id` took the DOM focus or lost it. An input taking it takes
-    /// it from the focused view.
+    /// Input `id` took the DOM focus or lost it. An attached input taking it
+    /// takes it from the focused view.
     pub fn focus(&mut self, id: u32, focused: bool) -> Pumped {
         if focused {
             // The view's Blur comes before the input's Focus.
             let transitions = {
                 let mut outbox = self.lock();
-                outbox.routes.input_focused(id);
+                if !outbox.routes.input_focused(id) {
+                    drop(outbox);
+                    return self.pump();
+                }
                 std::mem::take(&mut outbox.routes.transitions)
             };
             self.transitions(transitions);
         } else if !self.lock().routes.input_blurred(id) {
-            // A view took the focus from it: its Blur went first already.
+            // The input detached or a view took the focus from it.
             return self.pump();
         }
         let kind = if focused {
@@ -1804,6 +1812,7 @@ mod tests {
     fn ClosingModal() -> impl IntoElement {
         let heard = signal(String::new());
         let add = move |what: &'static str| heard.update(|h| h.push_str(what));
+        let content = element_ref();
         on_back_press(move || {
             add(" back");
             true
@@ -1816,9 +1825,18 @@ mod tests {
                 .on_close(move || add(" close"))
                 .child(
                     view()
+                        .element_ref(&content)
+                        .focusable(true)
                         .w(px(10.0))
                         .h(px(10.0))
-                        .on_key_down(move |_: &KeyEvent| add(" key")),
+                        .on_blur(move || add(" blur"))
+                        .on_key_down(move |e: &KeyEvent| {
+                            if &*e.key == "ColorF0Red" {
+                                content.focus();
+                            } else {
+                                add(" key");
+                            }
+                        }),
                 ),
         )
     }
@@ -1851,6 +1869,23 @@ mod tests {
             texts_of(&all).last().map(String::as_str),
             Some(" key cancel close back"),
             "not asked to close again: {all:?}"
+        );
+        assert!(!exits(&all));
+    }
+
+    #[test]
+    fn back_blurs_the_focused_view_in_a_closed_modal() {
+        let (mut runtime, _) = start(Root::of::<ClosingModal>());
+        let modal_content = runtime.key_target();
+        let red = ops(&runtime.remote_key(0, 403, "", "", true, false));
+        assert!(red.contains(&serde_json::json!(["fo", modal_content, true])));
+        runtime.remote_key(0, 403, "", "", false, false);
+
+        let all = back(&mut runtime);
+        assert_eq!(
+            texts_of(&all),
+            [" key", " key blur cancel close"],
+            "{all:?}"
         );
         assert!(!exits(&all));
     }

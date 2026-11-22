@@ -185,10 +185,17 @@ NshTizen.avplay = (function () {
             if (owner !== ctx || !opened || seekInFlight) return;
             var p = av();
             if (!p) return;
-            /* AVPlay's coordinates are 1920 × 1080 whatever the page's size. */
-            var k = 1920 / (window.innerWidth || 1920);
+            /* AVPlay's coordinates are 1920 × 1080 whatever the page's
+             * size; the rect is in points (ctx.scale page pixels each). */
+            var k = 1920 / (window.innerWidth || 1920) * (ctx.scale || 1);
             var r = rect && rect.visible ? rect : { x: 0, y: 0, width: 1, height: 1 };
-            try { p.setDisplayRect(Math.round(r.x * k), Math.round(r.y * k), Math.max(1, Math.round(r.width * k)), Math.max(1, Math.round(r.height * k))); } catch (e) { /* not open */ }
+            /* The method first, FULL_SCREEN: on a 2020 TV (UN55TU7000,
+             * Tizen 5.5) the default letterbox in a rect smaller than the
+             * screen shows no picture while the sound plays. */
+            try {
+                p.setDisplayMethod('PLAYER_DISPLAY_MODE_FULL_SCREEN');
+                p.setDisplayRect(Math.round(r.x * k), Math.round(r.y * k), Math.max(1, Math.round(r.width * k)), Math.max(1, Math.round(r.height * k)));
+            } catch (e) { /* not open */ }
         }
 
         /* The play/pause state the app asks for, once no seek runs: play

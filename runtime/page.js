@@ -13,6 +13,7 @@
  *       fonts: [{ family: 'Brand', url: 'fonts/brand.ttf', weight: 400 }],
  *       registerKeys: ['Tools'],         // more remote keys, by Tizen name
  *       backDebounceMs: 600,
+ *       scale: 2,                        // page pixels per layout point
  *       onHost: function (message) {},   // nsh_platform_tizen::host(json)
  *       onExit: function () {},          // Command::ExitApp (default: exit)
  *       onError: function (text) {}
@@ -99,7 +100,13 @@
         api.metrics = this.M;
         window.__nsh = this.M;
         this.container = options.container || document.getElementById('app');
-        this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M);
+        /* `scale` page pixels per layout point: an app laid out for a TV's
+         * 960 x 540 points (as Android TV reports a 1080p screen) asks for
+         * 2. The container is zoomed; the layout, the frames and the
+         * device the app sees are in points. */
+        this.scale = options.scale > 0 ? options.scale : 1;
+        if (this.scale !== 1) this.container.style.zoom = String(this.scale);
+        this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M, this.scale);
         /* Its components' errors are the session's (noted once, onError). */
         this.renderer.report = function (text) { self.error(text); };
         /* Metrics are saved before the app leaves. */
@@ -371,7 +378,8 @@
 
     S.start = function () {
         var self = this, options = this.options, M = this.M;
-        var device = options.device || { width: 1920, height: 1080, pixelRatio: 1, dark: true };
+        var device = options.device ||
+            { width: 1920 / this.scale, height: 1080 / this.scale, pixelRatio: this.scale, dark: true };
         M.scriptStart = Math.round(performance.now());
         M.ua = navigator.userAgent;
         var module = absolute(options.module || 'app.wasm');

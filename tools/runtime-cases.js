@@ -10,11 +10,11 @@
     var later = [];   /* asynchronous cases, run in order */
     function check(ok, what) { results.push([!!ok, what]); }
     function metrics() { return { unknown: {}, unknownComponents: {}, errors: [], batches: 0, ops: 0, applyMs: 0 }; }
-    function renderer(sent) {
+    function renderer(sent, scale) {
         var box = document.createElement('div');
         box.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px;visibility:hidden';
         document.body.appendChild(box);
-        return new NshTizen.Renderer(box, function (m) { sent.push(m); }, metrics());
+        return new NshTizen.Renderer(box, function (m) { sent.push(m); }, metrics(), scale);
     }
     var mount = [['c', 50, 'native'], ['i', 1, 50, null], ['f', 50, 10, 20, 300, 200]];
 
@@ -165,7 +165,9 @@
                 if (f.state !== 'PLAYING' && f.state !== 'PAUSED') { f.misuse.push('pause in ' + f.state); throw new Error('pause in ' + f.state); }
                 f.state = 'PAUSED';
             }),
-            setTimeoutForBuffering: rec('setTimeoutForBuffering'), setDisplayRect: rec('setDisplayRect'),
+            setTimeoutForBuffering: rec('setTimeoutForBuffering'),
+            setDisplayMethod: function (m) { f.calls.push('setDisplayMethod'); refuse('setDisplayMethod'); f.method = m; },
+            setDisplayRect: function (x, y, w, h) { f.calls.push('setDisplayRect'); refuse('setDisplayRect'); f.rect = [x, y, w, h]; },
             setListener: function (l) { f.calls.push('setListener'); refuse('setListener'); f.listener = l; },
             prepareAsync: function (ok, fail) { f.calls.push('prepareAsync'); refuse('prepareAsync'); f.prepared = { ok: function () { f.state = 'READY'; ok(); }, fail: fail }; },
             play: function () {
@@ -190,12 +192,12 @@
     }
 
     var realApi = NshTizen.avplay.api;
-    function withFake(test) {
+    function withFake(test, scale) {
         var f = fakeAvplay();
         NshTizen.avplay.api = function () { return f.api; };
         NshTizen.registerComponent('test.avplay', NshTizen.avplay);
         var sent = [];
-        var r = renderer(sent);
+        var r = renderer(sent, scale);
         r.apply(mount.concat([['n', 50, 'test.avplay']]));
         var events = function () {
             return sent.filter(function (m) { return m.t === 'native'; }).map(function (m) { return m.name + ' ' + m.data; });
@@ -206,12 +208,15 @@
         }
     }
 
+    var rectAt1 = null;
     withFake(function (f, r, events) {
         r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 1 }, paused: false }, []]]);
         f.prepared.ok();
         var order = f.calls.filter(function (c) { return c !== 'getCurrentStreamInfo'; }).join(',');
-        check(order === 'open,setTimeoutForBuffering,setDisplayRect,setListener,prepareAsync,setDisplayRect,play',
+        check(order === 'open,setTimeoutForBuffering,setDisplayMethod,setDisplayRect,setListener,prepareAsync,setDisplayMethod,setDisplayRect,play',
             'AVPlay calls in order: ' + order);
+        check(f.method === 'PLAYER_DISPLAY_MODE_FULL_SCREEN', 'the display method is FULL_SCREEN: ' + f.method);
+        rectAt1 = f.rect;
         check(events().indexOf('state {"state":"ready"}') >= 0, 'ready is reported');
         /* A new source: the old one's late callbacks do nothing. */
         var oldListener = f.listener, oldPrepared = f.prepared;
@@ -225,6 +230,14 @@
         oldPrepared.ok();
         check(events().length === before, 'late callbacks of the old stream are dropped');
     });
+
+    /* A page zoomed 2x (frames in points): the video plane's rect doubles. */
+    withFake(function (f, r) {
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 1 }, paused: false }, []]]);
+        f.prepared.ok();
+        var doubled = rectAt1 && f.rect && f.rect.every(function (v, i) { return v === rectAt1[i] * 2; });
+        check(doubled, 'at scale 2 the rect is twice the scale-1 one: ' + JSON.stringify([rectAt1, f.rect]));
+    }, 2);
 
     withFake(function (f, r, events) {
         /* play() throwing in prepareAsync's success: one failure path. */

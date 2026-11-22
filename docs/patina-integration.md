@@ -163,8 +163,9 @@ delivers, so the decoder should accept them; the platform won't remap them.
 Patina's `input::window` focuses its root only on long-press platforms. On
 Tizen its window view hears keys without a focus, because a key reported at
 the root starts at the app's mount root, so that works as is. Back is the
-`GoBack` key and, on the release of a press whose down and repeats the
-app's `captureKeys` took none of, the back button: the `onRequestClose` of
+`GoBack` key (a system key, as on Android: no `captureKeys` rule takes
+it, not even `all`, and the app still hears every transition) and, on
+the release of its press, the back button: the `onRequestClose` of
 the modal shown last (closing it here with `closeOnEscape`, then
 `onDismiss`), else the app's `onBackPress` (`on_back_press`), else the app
 leaves, as on Android. The release reaches the app's key listeners and is

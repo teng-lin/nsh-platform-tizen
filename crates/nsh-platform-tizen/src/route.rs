@@ -22,8 +22,8 @@
 //! without a press is dropped.
 //!
 //! The remote's Back is also the back button ([`Routes::back`]), as on
-//! Android: on the release of a press the app's `captureKeys` took no
-//! transition of, the newest modal shown (presentation order, as Android's
+//! Android (a system key no `captureKeys` takes): on the release of a
+//! press, the newest modal shown (presentation order, as Android's
 //! `shownModals`, not drawing order) is asked to close and, with
 //! `closeOnEscape`, closes here ([`Routes::close_modal`]: it leaves the
 //! page and takes no keys while the app catches up); without one the

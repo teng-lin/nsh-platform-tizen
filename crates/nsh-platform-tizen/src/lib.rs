@@ -509,10 +509,10 @@ pub struct Runtime<M: Measure + 'static> {
     outbox: Arc<Mutex<Outbox>>,
     /// The last key transition's capture decision.
     captured: bool,
-    /// Back held down: whether the app took (`captureKeys`, a shortcut)
-    /// its press or any of its repeats. Its release is the back button
-    /// when it took none, whatever the release itself does.
-    back_held: Option<bool>,
+    /// Back's press went to the app: its release is the back button,
+    /// whatever the app's listeners do with the keys (Back is a system
+    /// key, as on Android).
+    back_held: bool,
 }
 
 impl<M: Measure + 'static> Runtime<M> {
@@ -538,7 +538,7 @@ impl<M: Measure + 'static> Runtime<M> {
             control,
             outbox,
             captured: false,
-            back_held: None,
+            back_held: false,
         })
     }
 
@@ -726,6 +726,15 @@ impl<M: Measure + 'static> Runtime<M> {
         } else {
             EventKind::KeyUp
         };
+        // Back is a system key, as on Android (`KeyCaptures.captured`): no
+        // `captureKeys` rule takes it, not even `all`. The app still hears
+        // it, with `default_prevented` false, routed as any key.
+        if key == keys::BACK {
+            self.control
+                .dispatch_event(id, kind, EventPayload::Key(event));
+            self.captured = false;
+            return false;
+        }
         // The engine's own entry for a key (`#[doc(hidden)]` in NSH; its web
         // backend uses it too): it sets `default_prevented` from the
         // mounted `captureKeys` rules (the page cannot wait for that
@@ -749,9 +758,10 @@ impl<M: Measure + 'static> Runtime<M> {
     /// being edited. OK on a focused view that takes presses is a key
     /// there and, when the app's `captureKeys` did not take it, presses it.
     /// Repeats go where keys go now; the release to the views the last
-    /// down reached ([`route`]). Back's release is also the back button
-    /// when the app took neither its press nor a repeat: after the release
-    /// is committed, on what that left ([`route::Routes::back`]).
+    /// down reached ([`route`]). Back is a system key that no
+    /// `captureKeys` takes; the release of its press is also the back
+    /// button, after the release is committed, on what that left
+    /// ([`route::Routes::back`]).
     pub fn remote_key(
         &mut self,
         id: u32,
@@ -767,8 +777,10 @@ impl<M: Measure + 'static> Runtime<M> {
             .lock()
             .routes
             .route(key_code, key == "Enter", down, repeat, id);
-        let captured = match route {
-            route::Route::Key(target) => self.send_key(target, &key, dom_code, down, repeat),
+        match route {
+            route::Route::Key(target) => {
+                self.send_key(target, &key, dom_code, down, repeat);
+            }
             route::Route::Press(target) => {
                 let captured = self.send_key(target, &key, dom_code, down, repeat);
                 // The press is OK's default: only when nothing took the key.
@@ -776,24 +788,25 @@ impl<M: Measure + 'static> Runtime<M> {
                     self.control
                         .dispatch_event(target, EventKind::Press, EventPayload::None);
                 }
-                captured
             }
-            route::Route::Drop => false,
-        };
+            route::Route::Drop => {}
+        }
         if key != keys::BACK {
             return self.pump();
         }
-        // The back button, as Android's: the press and its repeats decide
-        // (a release the raw route drops or captures still goes back once
-        // its press went to the app untaken).
+        // The back button, as Android's: the release of a press the app
+        // got goes back, whatever its listeners did with the press, its
+        // repeats and the release (nothing captures Back, and this
+        // platform has no shortcuts that could consume it), and even when
+        // the release reaches no view. A release without its press does
+        // not.
         if down {
-            self.back_held = Some(match self.back_held {
-                Some(taken) if repeat => taken || captured,
-                _ => captured,
-            });
+            if !repeat {
+                self.back_held = true;
+            }
             return self.pump();
         }
-        if self.back_held.take() != Some(false) {
+        if !std::mem::take(&mut self.back_held) {
             return self.pump();
         }
         // The release goes first and its effects are committed (a TV app
@@ -1871,43 +1884,6 @@ mod tests {
         assert!(!exits(&all), "{all:?}");
     }
 
-    #[component]
-    fn CaptureRepeats() -> impl IntoElement {
-        let capture = signal(nsh_core::KeyCapture::None);
-        let heard = signal(String::new());
-        on_back_press(move || {
-            heard.set("back".into());
-            true
-        });
-        // The press turns the capture on: its repeat is taken; the repeat
-        // turns it off: the release is not.
-        view()
-            .capture_keys(move || capture.get())
-            .on_key_down(move |e: &KeyEvent| {
-                capture.set(if e.repeat {
-                    nsh_core::KeyCapture::None
-                } else {
-                    nsh_core::KeyCapture::All
-                })
-            })
-            .on_key_up(move |_: &KeyEvent| {})
-            .child(text(move || heard.get()))
-    }
-
-    /// A repeat the app took suppresses the back button, as its press
-    /// would: the press decides with its repeats, not the release.
-    #[test]
-    fn a_captured_repeat_suppresses_the_back_button() {
-        let (mut runtime, _) = start(Root::of::<CaptureRepeats>());
-        runtime.remote_key(0, 10009, "", "", true, false);
-        assert!(!runtime.key_captured());
-        runtime.remote_key(0, 10009, "", "", true, true);
-        assert!(runtime.key_captured());
-        let up = ops(&runtime.remote_key(0, 10009, "", "", false, false));
-        assert!(!runtime.key_captured());
-        assert!(texts_of(&up).is_empty() && !exits(&up), "{up:?}");
-    }
-
     /// Back's press reached views all gone at its release (the root's
     /// content replaced, as a new root does): the release is dropped, and
     /// the back button still goes, its press having gone to the app.
@@ -1981,25 +1957,47 @@ mod tests {
     #[component]
     fn BackCaptured() -> impl IntoElement {
         let heard = signal(String::new());
+        let add = move |what: String| heard.update(|h| h.push_str(&what));
         on_back_press(move || {
-            heard.set("back".into());
+            add(" back".into());
             true
         });
+        let seen = move |name: &str, e: &KeyEvent| {
+            if &*e.key == "GoBack" {
+                add(format!(" {name} {}", e.default_prevented));
+            }
+        };
         view()
             .capture_keys(nsh_core::KeyCapture::All)
-            .on_key_up(move |_: &KeyEvent| {})
+            .on_key_down(move |e: &KeyEvent| seen(if e.repeat { "repeat" } else { "down" }, e))
+            .on_key_up(move |e: &KeyEvent| seen("up", e))
             .child(text(move || heard.get()))
     }
 
-    /// A Back the app's `captureKeys` takes is only a key.
+    /// Back is a system key, as on Android: `captureKeys`, even `all`,
+    /// takes none of its transitions; the app still hears each (not
+    /// prevented), and its release is the back button.
     #[test]
-    fn a_captured_back_is_only_a_key() {
+    fn capture_keys_never_takes_back() {
         let (mut runtime, _) = start(Root::of::<BackCaptured>());
         runtime.remote_key(0, 10009, "", "", true, false);
+        assert!(!runtime.key_captured());
+        runtime.remote_key(0, 10009, "", "", true, true);
+        assert!(!runtime.key_captured());
+        let up = ops(&runtime.remote_key(0, 10009, "", "", false, false));
+        assert!(!runtime.key_captured());
+        assert_eq!(
+            texts_of(&up),
+            [
+                " down false repeat false up false",
+                " down false repeat false up false back"
+            ],
+            "{up:?}"
+        );
+        assert!(!exits(&up));
+        // Other keys stay the rule's.
+        runtime.remote_key(0, 13, "", "", true, false);
         assert!(runtime.key_captured());
-        let up = runtime.remote_key(0, 10009, "", "", false, false);
-        assert!(texts(&up).is_empty(), "{:?}", ops(&up));
-        assert!(!ops(&up).iter().any(|op| op[0] == "x"));
     }
 
     /// The texts of ops already decoded.

@@ -216,10 +216,12 @@ Volume, Menu and Source stay the TV's. `code` is the browser's
 `KeyboardEvent.code`. No `default_prevented`: the page can't wait for the
 Worker, so it prevents the default of every key in the table.
 
-Back is also the back button, as on Android: the app hears its press,
-repeats and release as `GoBack` keys, and the release of a press whose
-down and repeats the app's `captureKeys` took none of is the back button
-(the release's own capture and target do not matter). The release is
+Back is also the back button, as on Android: it is a system key, which no
+`captureKeys` rule takes, not even `all`. The app hears its press, repeats
+and release as `GoBack` keys (`defaultPrevented` false), and the release
+of a press is the back button, even when the release reaches no view
+(only an app's `onBackPress` that takes it, as Patina's `swallow_back`
+does, keeps it from going further). The release is
 committed first, so the back button acts on what it left (a TV app tells a
 tap from a hold on the release, and may open a confirmation there): the
 modal shown last (presentation order, as Android's, not drawing order)

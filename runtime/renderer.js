@@ -38,7 +38,8 @@ var NshTizen = (function () {
      *   NshTizen.registerComponent('tv.player', function (ctx) {
      *       // ctx.id, ctx.name, ctx.element (the container <div>),
      *       // ctx.emit(name, data): an event to the app (onNativeEvent),
-     *       // ctx.rect(): the container's rect on the page.
+     *       // ctx.rect(): the container's rect on the page, in points,
+     *       // ctx.scale: page pixels per point.
      *       return {
      *           props: function (changed, all, removed) {},  // after every change
      *           frame: function (rect) {},          // {x, y, width, height, visible}
@@ -106,8 +107,12 @@ var NshTizen = (function () {
             'px;height:' + this.h + 'px;' + this.extra + this.css + this.anim;
     };
 
-    function Renderer(container, send, M) {
+    /* `scale`: page pixels per layout point (the container is zoomed by
+     * it, see page.js), 1 when omitted; `size`: the root's `{w, h}` in
+     * points (default: the container's). */
+    function Renderer(container, send, M, scale, size) {
         this.send = send;
+        this.scale = scale > 0 ? scale : 1;
         this.M = M;
         this.nodes = {};
         this.editing = null;      /* the input with the DOM focus */
@@ -132,8 +137,8 @@ var NshTizen = (function () {
         this.placeholderRules = {};
         this.phStyle = null;
         var root = new Node(ROOT_ID, 'view');
-        root.w = container.clientWidth || 1920;
-        root.h = container.clientHeight || 1080;
+        root.w = size ? size.w : (container.clientWidth || 1920) / this.scale;
+        root.h = size ? size.h : (container.clientHeight || 1080) / this.scale;
         root.restyle();
         this.nodes[ROOT_ID] = root;
         this.container = container;
@@ -607,7 +612,8 @@ var NshTizen = (function () {
                 try { json = JSON.stringify(data === undefined ? null : data); } catch (e) { json = 'null'; }
                 self.send({ t: 'native', id: n.id, name: String(event), data: json });
             },
-            rect: function () { return self.rectOf(n); }
+            rect: function () { return self.rectOf(n); },
+            scale: this.scale
         };
         comp.instance = this.guard(n, 'factory', function () { return factory(ctx); }) || {};
         this.componentNodes.push(n);

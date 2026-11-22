@@ -63,12 +63,23 @@ NshTizen.start({
     fonts: [],                         // [{ family, url, weight, style }]
     registerKeys: [],                  // more remote keys, by Tizen name
     backDebounceMs: 600,               // Back presses closer than this are one
+    scale: 1,                          // page pixels per layout point (see below)
     onHost: function (message) {},     // nsh_platform_tizen::host(json) from the app
     onExit: function () {},            // Command::ExitApp (default: the app exits)
     onError: function (text) {}        // errors, a Worker that failed, an app that stopped
 });
 NshTizen.stop();                       // ends the session (a second start does too)
 ```
+
+**Scale.** With `scale: 2` the container is zoomed 2x and the app sees a
+960 x 540 point screen at pixel ratio 2, as Android TV reports a 1080p
+TV, so a layout made for TV points comes out at its intended size. Frames,
+component rects (`ctx.rect()`) and the device the app gets are in points;
+`ctx.scale` gives page pixels per point. The default, 1, lays out in page
+pixels (the test app's 1920 x 1080). The container is sized in points
+while zoomed and restored when the session ends. A host that passes its
+own `device` must make it agree with `scale`. Text is measured in points
+and drawn zoomed.
 
 Each `start` is a session: a second one ends the first, with its Worker,
 DOM, listeners and callbacks. Every host callback (`onHost`, `onError`,
@@ -78,7 +89,8 @@ below); `build.sh` writes the module's version into `app-config.js`.
 
 **Native components.** `native("name")` in the app mounts the factory
 registered under `name`. It gets `ctx`: `id`, `name`, `element` (the
-container `<div>`), `emit(event, data)` (to `on_native_event`) and `rect()`.
+container `<div>`), `emit(event, data)` (to `on_native_event`), `rect()`
+(in points) and `scale` (page pixels per point).
 It returns any of these methods:
 
 - `props(changed, all, removed)`: JSON props by name, after every commit

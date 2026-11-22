@@ -265,6 +265,23 @@ for (const file of ['index.html', 'page-thread.html']) {
     await p.evaluate('NshTizen.start({ container: document.getElementById("app"), module: "app.wasm", version: window.NSH_MODULE_VERSION, thread: window.NSH_THREAD || "worker" }) && 1');
     check(await p.until('window.__nsh.firstPaintAt > 0', 20000), 'a second start paints');
     check(await p.evaluate('document.getElementById("app").children.length') === 1, 'and the first session\'s DOM is gone');
+
+    // A session at scale 2 zooms the container and lays out in points; the
+    // next session at scale 1 gets the container back as it was.
+    const unzoomed = await p.evaluate('(function () { var a = document.getElementById("app"); return a.style.zoom + "|" + a.style.width + "|" + a.clientWidth; })()');
+    await p.evaluate('NshTizen.start({ container: document.getElementById("app"), module: "app.wasm", version: window.NSH_MODULE_VERSION, thread: window.NSH_THREAD || "worker", scale: 2 }) && 1');
+    check(await p.until('window.__nsh.firstPaintAt > 0', 20000), 'a start at scale 2 paints');
+    const zoomed = JSON.parse(await p.evaluate(`(function () {
+        var a = document.getElementById("app"), root = a.firstChild;
+        return JSON.stringify({ zoom: a.style.zoom, w: a.style.width, rootW: root.style.width,
+            fits: a.getBoundingClientRect().width <= window.innerWidth + 1 });
+    })()`));
+    check(zoomed.zoom === '2' && parseFloat(zoomed.rootW) * 2 === parseFloat(unzoomed.split('|')[2]) && zoomed.fits,
+        'at scale 2 the root is half the container in points and the container stays in the window: ' + JSON.stringify(zoomed));
+    await p.evaluate('NshTizen.start({ container: document.getElementById("app"), module: "app.wasm", version: window.NSH_MODULE_VERSION, thread: window.NSH_THREAD || "worker" }) && 1');
+    check(await p.until('window.__nsh.firstPaintAt > 0', 20000), 'a start at scale 1 after it paints');
+    const restored = await p.evaluate('(function () { var a = document.getElementById("app"); return a.style.zoom + "|" + a.style.width + "|" + a.clientWidth; })()');
+    check(restored === unzoomed, 'and the container is as before the zoom: ' + unzoomed + ' / ' + restored);
     p.ws.close();
 }
 

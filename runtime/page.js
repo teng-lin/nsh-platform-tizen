@@ -13,6 +13,7 @@
  *       fonts: [{ family: 'Brand', url: 'fonts/brand.ttf', weight: 400 }],
  *       registerKeys: ['Tools'],         // more remote keys, by Tizen name
  *       backDebounceMs: 600,
+ *       scale: 2,                        // page pixels per layout point
  *       onHost: function (message) {},   // nsh_platform_tizen::host(json)
  *       onExit: function () {},          // Command::ExitApp (default: exit)
  *       onError: function (text) {}
@@ -99,7 +100,28 @@
         api.metrics = this.M;
         window.__nsh = this.M;
         this.container = options.container || document.getElementById('app');
-        this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M);
+        /* `scale` page pixels per layout point: an app laid out for a TV's
+         * 960 x 540 points (as Android TV reports a 1080p screen) asks for
+         * 2. The container is zoomed; the layout, the frames and the
+         * device the app sees are in points. */
+        this.scale = options.scale > 0 ? options.scale : 1;
+        /* The screen in points: the container's size before it is zoomed.
+         * Zoomed, the container is sized in points, so that it covers the
+         * same page pixels and nothing of it lies outside the window (the
+         * browser would scroll to a focused input out there). */
+        var cs = this.container.style;
+        this.size = {
+            w: (this.container.clientWidth || window.innerWidth || 1920) / this.scale,
+            h: (this.container.clientHeight || window.innerHeight || 1080) / this.scale
+        };
+        this.restore = null;
+        if (this.scale !== 1) {
+            this.restore = { zoom: cs.zoom, width: cs.width, height: cs.height };
+            cs.width = this.size.w + 'px';
+            cs.height = this.size.h + 'px';
+            cs.zoom = String(this.scale);
+        }
+        this.renderer = new api.Renderer(this.container, function (m) { self.send(m); }, this.M, this.scale, this.size);
         /* Its components' errors are the session's (noted once, onError). */
         this.renderer.report = function (text) { self.error(text); };
         /* Metrics are saved before the app leaves. */
@@ -371,7 +393,10 @@
 
     S.start = function () {
         var self = this, options = this.options, M = this.M;
-        var device = options.device || { width: 1920, height: 1080, pixelRatio: 1, dark: true };
+        /* The device the app sees: the screen in points (a host's own
+         * `device` must agree with its `scale`). */
+        var device = options.device ||
+            { width: this.size.w, height: this.size.h, pixelRatio: this.scale, dark: true };
         M.scriptStart = Math.round(performance.now());
         M.ua = navigator.userAgent;
         var module = absolute(options.module || 'app.wasm');
@@ -445,6 +470,12 @@
         clearTimeout(this.saveTimer);
         this.saveNow();
         this.renderer.dispose();
+        /* The container as the host gave it (a later session may not zoom). */
+        if (this.restore) {
+            var cs = this.container.style;
+            cs.zoom = this.restore.zoom; cs.width = this.restore.width; cs.height = this.restore.height;
+            this.restore = null;
+        }
         this.waiting = {};
     };
 

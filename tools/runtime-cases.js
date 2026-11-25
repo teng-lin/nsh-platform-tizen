@@ -336,6 +336,31 @@
         }
     });
 
+    withFake(function (f, r, events) {
+        var hidden = false;
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hidden; } });
+        try {
+            r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8' } }, []]]);
+            f.prepared.ok();
+            f.listener.oncurrentplaytime(1000);
+            hidden = true;
+            document.dispatchEvent(new Event('visibilitychange'));
+            check(pictureEvents(events) === '', 'a missing source token produces no picture evidence');
+
+            r.apply([['np', 50, { source: { url: 'https://x.test/b.m3u8', token: 0 } }, []]]);
+            hidden = false;
+            document.dispatchEvent(new Event('visibilitychange'));
+            f.prepared.ok();
+            f.listener.oncurrentplaytime(1000);
+            hidden = true;
+            document.dispatchEvent(new Event('visibilitychange'));
+            check(pictureEvents(events) === 'firstRender {"token":0},pictureLost {"token":0}',
+                'an explicit zero source token owns its picture evidence');
+        } finally {
+            delete document.hidden;
+        }
+    });
+
     /* The cases below wait for the fake's asynchronous seeks. */
     function wait(ms) { return new Promise(function (ok) { setTimeout(ok, ms); }); }
     function withFakeAsync(test) {
@@ -584,7 +609,16 @@
         hidden = false;
         document.dispatchEvent(new Event('visibilitychange'));
         check(f.calls.filter(function (c) { return c === 'open'; }).length === 1, 'the same token waits for AVPlay to close');
-        return wait(100).then(function () {
+        var reopened = new Promise(function (resolve, reject) {
+            var timeout = setTimeout(function () { reject(new Error('timed out waiting for AVPlay to reopen')); }, 1000);
+            var open = f.api.open;
+            f.api.open = function () {
+                open();
+                clearTimeout(timeout);
+                resolve();
+            };
+        });
+        return reopened.then(function () {
             check(f.calls.filter(function (c) { return c === 'open'; }).length === 2, 'the same token reopens once the retry closes AVPlay');
             f.prepared.ok();
             f.listener.oncurrentplaytime(0);

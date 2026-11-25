@@ -119,6 +119,7 @@ instance, or anything the host page opened itself, reports `busy`.
 On hide, `pictureLost {token}` identifies the source whose opening was
 torn down, after the stop and close attempt. A `firstRender {token}` is
 reported once per opening on the first playing time after playback starts.
+A source token must be a nonnegative safe integer for either event.
 A source reopened paused keeps its token and reports a new `firstRender`
 after it plays. Rebuffering reports the usual `state` events and keeps the
 opening's picture evidence.

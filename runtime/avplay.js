@@ -117,6 +117,8 @@ NshTizen.avplay = (function () {
         try { return p.getState(); } catch (e) { return 'UNKNOWN'; }
     }
 
+    function validSourceToken(token) { return Number.isSafeInteger(token) && token >= 0; }
+
     /* Runs `f` now, or when the running seek ends (whatever instance or
      * generation started it: a teardown must still happen). */
     function whenIdle(f) {
@@ -166,7 +168,7 @@ NshTizen.avplay = (function () {
                 else { owner = STUCK; startStuckRetry(); }
                 /* This opening's picture is no longer usable even if
                  * close has to be retried. Report before a queued reopen. */
-                if (Number.isSafeInteger(pictureToken) && pictureToken > 0) {
+                if (validSourceToken(pictureToken)) {
                     emit('pictureLost', { token: pictureToken });
                 }
             });
@@ -329,9 +331,9 @@ NshTizen.avplay = (function () {
                         if (!live()) return;
                         /* A seek on a prepared, paused opening can report
                          * a position before the player has played. */
-                        if (started && !rendered) {
+                        if (started && !rendered && validSourceToken(source.token)) {
                             rendered = true;
-                            emit('firstRender', { token: source.token || 0 });
+                            emit('firstRender', { token: source.token });
                         }
                         if (!sizeSent) sendSize();
                         if (ms - lastPosition >= 1000 || ms < lastPosition) { lastPosition = ms; emit('position', { ms: ms }); }

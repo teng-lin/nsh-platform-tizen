@@ -108,13 +108,21 @@ An unknown name leaves the container empty and is counted in
 **The example player** (`NshTizen.avplay`) takes the props `source`
 `{url, token}` or `null`, `paused` and `seek` `{token, id, ms}`. It emits
 `state` (`idle`, `buffering`, `ready`, `ended`), `size`, `firstRender`,
-`position`, `timeline` and `error`. It calls AVPlay in the documented order
-(`open`, buffering timeout, rect, listener, `prepareAsync`, rect again,
-`play`). It closes the player after every error, drops stale callbacks by
-token, stops while the page is hidden and reopens when it is shown, and
-never touches a player it didn't open. AVPlay is one player per app: it is
-taken only when free (getState NONE), so a second instance, or anything the
-host page opened itself, reports `busy`.
+`pictureLost`, `position`, `timeline` and `error`. It calls AVPlay in the
+documented order (`open`, buffering timeout, rect, listener, `prepareAsync`,
+rect again, `play`). It closes the player after every error, drops stale
+callbacks by opening generation, stops while the page is hidden and reopens
+when it is shown, and never touches a player it didn't open. AVPlay is one
+player per app: it is taken only when free (getState NONE), so a second
+instance, or anything the host page opened itself, reports `busy`.
+
+On hide, `pictureLost {token}` identifies the source whose opening was
+torn down, after the stop and close attempt. A `firstRender {token}` is
+reported once per opening on the first playing time after playback starts.
+A source token must be a nonnegative safe integer for either event.
+A source reopened paused keeps its token and reports a new `firstRender`
+after it plays. Rebuffering reports the usual `state` events and keeps the
+opening's picture evidence.
 
 Samsung's `seekTo` must complete before any other AVPlay call ("During this
 async operation, the other API would not be allowed ... wait for one of both

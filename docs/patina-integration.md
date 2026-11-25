@@ -77,7 +77,8 @@ name. The platform passes the wire contract through unchanged:
   (`visible: false` when it is detached or empty). AVPlay's
   `setDisplayRect` takes these coordinates.
 - `ctx.emit(name, data)`: the contract's events (`state`, `size`,
-  `firstRender`, `error`, `position`, `timeline`, `tracks`, `format`, ...)
+  `firstRender`, `pictureLost`, `error`, `position`, `timeline`, `tracks`,
+  `format`, ...)
   reach `on_native_event` as `NativeEvent { name, data }`, which
   `PlayerEvent::decode` reads.
 - `command(name, args)`: `ElementRef::command`; the contract has none today.
@@ -86,7 +87,11 @@ name. The platform passes the wire contract through unchanged:
 `runtime/avplay.js` is a working starting point for Patina's implementation.
 It covers `source`, `paused` and `seek`, and emits `state`
 (`idle`/`buffering`/`ready`/`ended`), `size`, `firstRender`, `position`,
-`timeline` and `error`. What Patina's implementation adds: `headers`
+`pictureLost`, `timeline` and `error`. Page hide tears down the current
+opening and sends `pictureLost {token}` for its source, so the app can
+paint its backdrop until the reopened stream plays and sends a new
+`firstRender {token}`. Rebuffering keeps the existing picture evidence.
+What Patina's implementation adds: `headers`
 (AVPlay can't set arbitrary headers, so `publicOnly` sources only, or a
 relay), `reconnect`/`live` semantics (keep the last frame), `tracks` and
 `format` from `getTotalTrackInfo`, track selection, and multiview, which

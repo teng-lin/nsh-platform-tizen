@@ -14,8 +14,9 @@
  * Events:
  *   state       {state}: idle | buffering | ready | ended
  *   size        {width, height}: the video's, once known
- *   firstRender {token}: the first playing time after opening (AVPlay
- *               reports no frame presentation; this is the nearest)
+ *   firstRender {token}: the first playing time once playback starts on
+ *               each open (AVPlay reports no frame presentation)
+ *   pictureLost {token}: the open released its picture on page hide
  *   position    {ms}: about once a second
  *   timeline    {token, seekId, ms, durationMs, seekable, failed?, stale?}:
  *               after a seek; `failed: true` when it did not happen,
@@ -30,12 +31,12 @@
  * nothing of theirs is touched. A player whose close failed stays taken
  * until a close succeeds or AVPlay reports it closed.
  *
- * Each opening is a generation (`token`), invalidated before anything is
- * torn down, so a late callback of an older one does nothing. Samsung's
- * seekTo must complete before any other AVPlay call: while a seek runs,
- * every call waits (play, pause, the rect, metadata reads, and a stop,
- * close or reopen from a zap, a hide or the view's removal), and runs
- * when the seek's callback comes. Samsung: "During this async operation,
+ * Each opening has its own generation, invalidated before teardown, so a
+ * late callback of an older one does nothing even for the same source
+ * token. Samsung's seekTo must complete before any other AVPlay call.
+ * During a seek, every call waits (play, pause, the rect, metadata reads,
+ * and a stop, close or reopen from a zap, a hide or the view's removal),
+ * and runs when the seek's callback comes. Samsung: "During this async operation,
  * the other API would not be allowed ... wait for one of both callbacks
  * (SuccessCallback, errorCallback) before any other API call" (AVPlay API
  * reference, seekTo); getState is not exempted, so nothing polls it. A
@@ -116,6 +117,8 @@ NshTizen.avplay = (function () {
         try { return p.getState(); } catch (e) { return 'UNKNOWN'; }
     }
 
+    function validSourceToken(token) { return Number.isSafeInteger(token) && token >= 0; }
+
     /* Runs `f` now, or when the running seek ends (whatever instance or
      * generation started it: a teardown must still happen). */
     function whenIdle(f) {
@@ -137,11 +140,11 @@ NshTizen.avplay = (function () {
     function factory(ctx) {
         var props = {};
         var rect = null;
-        var token = 0;        /* the current generation */
+        var generation = 0;   /* distinct from the app's source token */
         var opened = null;    /* the source this instance opened */
         var prepared = false;
-        var started = false;  /* it played since it was prepared */
-        var sizeSent = false, rendered = false, lastPosition = -1e9;
+        var started = false;  /* playback was requested for this opening */
+        var sizeSent = false, lastPosition = -1e9;
         var lastDuration = 0;  /* the source's duration, as last read */
         var doneSeek = null;  /* the app's last completed seek {token, id} */
         var pendingSeek = null;
@@ -152,7 +155,7 @@ NshTizen.avplay = (function () {
         function emit(name, data) { if (!gone) ctx.emit(name, data); }
 
         /* Closes this instance's player (now, or after the running seek). */
-        function closePlayer() {
+        function closePlayer(pictureToken) {
             whenIdle(function () {
                 if (owner !== ctx) return;
                 var p = av();
@@ -163,16 +166,21 @@ NshTizen.avplay = (function () {
                 }
                 if (closed) owner = null;
                 else { owner = STUCK; startStuckRetry(); }
+                /* This opening's picture is no longer usable even if
+                 * close has to be retried. Report before a queued reopen. */
+                if (validSourceToken(pictureToken)) {
+                    emit('pictureLost', { token: pictureToken });
+                }
             });
         }
 
         /* The one teardown: invalidate callbacks, then close and release. */
-        function teardown() {
-            token++;
+        function teardown(pictureToken) {
+            generation++;
             prepared = false;
             started = false;
             opened = null;
-            closePlayer();
+            closePlayer(pictureToken);
         }
 
         function fail(code) {
@@ -208,8 +216,10 @@ NshTizen.avplay = (function () {
             if (owner !== ctx || !prepared || seekInFlight) return;
             try {
                 if (!props.paused) {
-                    if (state(av()) !== 'PLAYING') av().play();
+                    var p = av(), playing = state(p) === 'PLAYING';
+                    /* A playing-time callback can run inside play(). */
                     started = true;
+                    if (!playing) p.play();
                 } else if (started && state(av()) === 'PLAYING') {
                     av().pause();
                 }
@@ -225,13 +235,13 @@ NshTizen.avplay = (function () {
          * not the player's). Then what waited runs, and the latest state
          * and seek are applied. */
         function seekTo(ms, done) {
-            var p = av(), my = token;
+            var p = av(), my = generation;
             var flight = { ms: ms, answered: false };
             seekInFlight = flight;
             var answer = function (ok) {
                 if (flight.answered) return;
                 flight.answered = true;
-                if (done) done(ok, my === token);
+                if (done) done(ok, my === generation);
             };
             var release = function (ok) {
                 if (seekInFlight !== flight) return;
@@ -242,7 +252,7 @@ NshTizen.avplay = (function () {
                 var waiting = afterSeek;
                 afterSeek = [];
                 waiting.forEach(function (f) { f(); });
-                if (my !== token || seekInFlight) return;
+                if (my !== generation || seekInFlight) return;
                 applyRect();
                 reconcile();
                 if (pendingSeek) seek(pendingSeek);
@@ -265,10 +275,10 @@ NshTizen.avplay = (function () {
              * 2020 set. */
             var p = av();
             if (!p) { emit('error', { code: 'unavailable' }); return; }
-            if (owner === ctx) teardown(); else token++;
-            var my = token;
+            if (owner === ctx) teardown(); else generation++;
+            var my = generation;
             var attempt = function () {
-                if (my !== token || gone) return;
+                if (my !== generation || gone) return;
                 /* Hidden meanwhile (a zap queued behind a seek, then a
                  * hide): opened when the page shows again. */
                 var ms = typeof startMs === 'function' ? startMs() : startMs;
@@ -292,14 +302,15 @@ NshTizen.avplay = (function () {
         }
 
         function openNow(p, source, startMs, my) {
-            sizeSent = false; rendered = false; lastPosition = -1e9;
+            sizeSent = false; lastPosition = -1e9;
             /* The same source reopened keeps its completed seek. */
             if (!(doneSeek && doneSeek.token === source.token)) {
                 doneSeek = null;
                 lastDuration = 0;
             }
             pendingSeek = props.seek || null;
-            var live = function () { return my === token && owner === ctx; };
+            var rendered = false;
+            var live = function () { return my === generation && owner === ctx; };
             try {
                 p.open(source.url);
             } catch (e) {
@@ -318,7 +329,12 @@ NshTizen.avplay = (function () {
                     onbufferingcomplete: function () { if (live()) emit('state', { state: 'ready' }); },
                     oncurrentplaytime: function (ms) {
                         if (!live()) return;
-                        if (!rendered) { rendered = true; emit('firstRender', { token: source.token || 0 }); }
+                        /* A seek on a prepared, paused opening can report
+                         * a position before the player has played. */
+                        if (started && !rendered && validSourceToken(source.token)) {
+                            rendered = true;
+                            emit('firstRender', { token: source.token });
+                        }
                         if (!sizeSent) sendSize();
                         if (ms - lastPosition >= 1000 || ms < lastPosition) { lastPosition = ms; emit('position', { ms: ms }); }
                     },
@@ -418,7 +434,7 @@ NshTizen.avplay = (function () {
                         if (owner !== ctx) return;
                         try { h.ms = av().getCurrentTime(); } catch (e) { /* live */ }
                     });
-                    teardown();
+                    teardown(h.source.token);
                 }
             } else if (hidden) {
                 var h = hidden;

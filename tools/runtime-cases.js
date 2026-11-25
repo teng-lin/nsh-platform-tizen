@@ -208,6 +208,10 @@
         }
     }
 
+    function pictureEvents(events) {
+        return events().filter(function (e) { return /^(firstRender|pictureLost) /.test(e); }).join(',');
+    }
+
     var rectAt1 = null;
     withFake(function (f, r, events) {
         r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 1 }, paused: false }, []]]);
@@ -270,6 +274,66 @@
         r2.apply(mount.concat([['n', 50, 'test.avplay'], ['np', 50, { source: { url: 'https://x.test/b.m3u8', token: 1 } }, []]]));
         check(!sent2.some(function (m) { return m.t === 'native' && m.data.indexOf('busy') >= 0; }), 'the next player is not busy');
         r2.dispose();
+    });
+
+    withFake(function (f, r, events) {
+        var hidden = false;
+        var node = r.nodes[50];
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hidden; } });
+        try {
+            r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 18 } }, []]]);
+            f.prepared.ok();
+            var oldListener = f.listener;
+            oldListener.oncurrentplaytime(1000);
+            var first = 'firstRender {"token":18}';
+            var lost = 'pictureLost {"token":18}';
+            var before = events().length;
+            oldListener.onbufferingstart();
+            oldListener.onbufferingcomplete();
+            oldListener.oncurrentplaytime(1500);
+            check(events().slice(before).join(',') === 'state {"state":"buffering"},state {"state":"ready"}' &&
+                pictureEvents(events) === first, 'rebuffer reports state and preserves the existing picture');
+
+            r.apply([['np', 50, { paused: true }, []]]);
+            f.time = 1500;
+            hidden = true;
+            document.dispatchEvent(new Event('visibilitychange'));
+            document.dispatchEvent(new Event('visibilitychange'));
+            check(f.state === 'NONE' && pictureEvents(events) === [first, lost].join(','), 'hide closes the paused stream and reports its picture loss once');
+
+            hidden = false;
+            document.dispatchEvent(new Event('visibilitychange'));
+            f.seekHangs = true;
+            f.prepared.ok();
+            before = events().length;
+            oldListener.oncurrentplaytime(2000);
+            check(events().length === before, 'callbacks from the closed opening are ignored after the same token reopens');
+            f.listener.oncurrentplaytime(1500);
+            f.seekHangs = false;
+            f.hanging.ok();
+            check(f.state === 'READY' && r.nodes[50] === node && pictureEvents(events) === [first, lost].join(','),
+                'return keeps the player view and a saved-position seek leaves it prepared paused without a picture');
+
+            var play = f.api.play;
+            f.api.play = function () { play(); f.listener.oncurrentplaytime(1500); };
+            r.apply([['np', 50, { paused: false }, []]]);
+            check(pictureEvents(events) === [first, lost, first].join(','), 'a playing time delivered inside play renders the reopened token');
+            f.api.play = play;
+            f.listener.oncurrentplaytime(2500);
+            check(pictureEvents(events) === [first, lost, first].join(','), 'resume renders the same token once for the new opening');
+
+            hidden = true;
+            document.dispatchEvent(new Event('visibilitychange'));
+            r.apply([['np', 50, { source: { url: 'https://x.test/b.m3u8', token: 19 } }, []]]);
+            hidden = false;
+            document.dispatchEvent(new Event('visibilitychange'));
+            f.prepared.ok();
+            f.listener.oncurrentplaytime(0);
+            check(pictureEvents(events) === [first, lost, first, lost, 'firstRender {"token":19}'].join(','),
+                'a source change while hidden reports loss for the old opening and renders the new source');
+        } finally {
+            delete document.hidden;
+        }
     });
 
     /* The cases below wait for the fake's asynchronous seeks. */
@@ -502,6 +566,33 @@
     });
 
     withFakeAsync(function (f, r, events) {
+        var hidden = false;
+        Object.defineProperty(document, 'hidden', { configurable: true, get: function () { return hidden; } });
+        NshTizen.avplay.stuckRetryMs = 20;
+        var restore = function () {
+            delete document.hidden;
+            NshTizen.avplay.stuckRetryMs = 1000;
+        };
+        r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 20 } }, []]]);
+        f.prepared.ok();
+        f.listener.oncurrentplaytime(1000);
+        f.closeFails = 2;
+        hidden = true;
+        document.dispatchEvent(new Event('visibilitychange'));
+        var beforeReopen = 'firstRender {"token":20},pictureLost {"token":20}';
+        check(f.state === 'IDLE' && pictureEvents(events) === beforeReopen, 'picture loss is reported when a hide stops playback and close needs a retry');
+        hidden = false;
+        document.dispatchEvent(new Event('visibilitychange'));
+        check(f.calls.filter(function (c) { return c === 'open'; }).length === 1, 'the same token waits for AVPlay to close');
+        return wait(100).then(function () {
+            check(f.calls.filter(function (c) { return c === 'open'; }).length === 2, 'the same token reopens once the retry closes AVPlay');
+            f.prepared.ok();
+            f.listener.oncurrentplaytime(0);
+            check(pictureEvents(events) === beforeReopen + ',firstRender {"token":20}', 'the retry does not repeat the old opening\'s picture loss');
+        }).then(restore, function (e) { restore(); throw e; });
+    });
+
+    withFakeAsync(function (f, r, events) {
         /* Hidden and shown again before the app's seek answers: reopened
          * where the player was once the seek ended, not at 0. */
         var hidden = false;
@@ -509,16 +600,22 @@
         var restore = function () { delete document.hidden; };
         r.apply([['np', 50, { source: { url: 'https://x.test/a.m3u8', token: 16 } }, []]]);
         f.prepared.ok();
+        f.listener.oncurrentplaytime(1000);
         f.seekHangs = true;
         r.apply([['np', 50, { seek: { token: 16, id: 1, ms: 9000 } }, []]]);
         hidden = true;
         document.dispatchEvent(new Event('visibilitychange'));
         hidden = false;
         document.dispatchEvent(new Event('visibilitychange'));
+        var first = 'firstRender {"token":16}';
+        check(pictureEvents(events) === first, 'the picture is not released while the close waits for a seek');
         f.seekHangs = false;
         f.time = 9000;
         f.calls = [];
+        var before = events().length;
         f.hanging.ok();
+        check(events().slice(before).filter(function (e) { return !/^timeline /.test(e); }).join(',') ===
+            'pictureLost {"token":16},state {"state":"buffering"}', 'quick hide and show reports picture loss before the same token starts reopening');
         return wait(20).then(function () {
             f.prepared.ok();
             return wait(60);
